@@ -13,11 +13,12 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(CURL REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Sql)
 
 enable_testing()
 
 add_subdirectory(engine)
+add_subdirectory(store)
 add_subdirectory(cli)
 add_subdirectory(gui)
 add_subdirectory(tests)

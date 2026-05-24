@@ -4,10 +4,12 @@ add_executable(fdm-gui
   main.cpp
   MainWindow.cpp
   MainWindow.h
-  EngineBridge.cpp
-  EngineBridge.h
+  NewDownloadDialog.cpp
+  NewDownloadDialog.h
+  DownloadDetailsWindow.cpp
+  DownloadDetailsWindow.h
 )
-target_link_libraries(fdm-gui PRIVATE fdm_engine Qt6::Widgets)
+target_link_libraries(fdm-gui PRIVATE fdm_store Qt6::Widgets)
 
 # Copy the launcher wrapper next to the binary so users can run the GUI from
 # any shell (including snap-confined ones that pollute LD_LIBRARY_PATH).

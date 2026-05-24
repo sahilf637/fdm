@@ -7,6 +7,7 @@ add_executable(fdm_tests
   test_engine_retry.cpp
   test_engine_fallback.cpp
   test_engine_robustness.cpp
+  test_paths.cpp
 )
 target_include_directories(fdm_tests PRIVATE
   third_party

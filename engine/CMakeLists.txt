@@ -2,6 +2,7 @@ add_library(fdm_engine STATIC
   src/DownloadEngine.cpp
   src/ChunkMath.cpp
   src/ChunkTask.cpp
+  src/Paths.cpp
 )
 
 target_include_directories(fdm_engine PUBLIC include)

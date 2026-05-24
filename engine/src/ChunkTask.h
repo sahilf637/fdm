@@ -19,7 +19,12 @@ class ChunkTask {
 public:
     static constexpr int kMaxAttempts = 4;
 
-    ChunkTask(std::string url, std::string outputPath, ChunkSpec spec);
+    // initialBytesReceived = bytes already written for this chunk (only set
+    // when restoring from persistent state). The constructor advances the
+    // file pointer past them and configures CURLOPT_RANGE to resume after
+    // them; `attempts` is the attempts counter to restore (1 if fresh).
+    ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
+              std::int64_t initialBytesReceived = 0, int initialAttempts = 1);
     ~ChunkTask();
 
     ChunkTask(const ChunkTask&) = delete;
@@ -33,6 +38,12 @@ public:
     // to (startByte + bytesWritten)-endByte. Returns true if a retry slot is
     // available (attempts < kMaxAttempts), false if exhausted.
     bool prepareRetry();
+
+    // Like prepareRetry, but without consuming a retry attempt. Used by
+    // DownloadEngine::resume to pick up where pause left off. Returns true
+    // if there is still work to do (resumeStart <= endByte), false if the
+    // chunk is already complete.
+    bool reconfigureForResume();
 
     std::int64_t bytesWritten() const { return bytesWrittenSoFar_; }
     const ChunkSpec& spec() const { return spec_; }

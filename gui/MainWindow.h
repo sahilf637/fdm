@@ -1,58 +1,64 @@
 #pragma once
 
-#include <QList>
+#include <QHash>
 #include <QMainWindow>
+#include <QPointer>
+#include <QtGlobal>
 
-#include "EngineBridge.h"
+class QAction;
+class QItemSelection;
+class QTableView;
 
-class QLineEdit;
-class QPushButton;
-class QProgressBar;
-class QLabel;
-class QTableWidget;
+namespace fdm::store {
+class DownloadListModel;
+class DownloadManager;
+}  // namespace fdm::store
 
 namespace fdm_gui {
 
+class DownloadDetailsWindow;
+
+// Top-level download-history window. Lists every persisted download (live
+// and historical) and lets the user start new ones, pause/resume/cancel
+// existing ones, or open a details window per row.
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
-    explicit MainWindow(QWidget* parent = nullptr);
+    // `manager` is owned by the caller (typically main()) and must outlive
+    // this window.
+    explicit MainWindow(fdm::store::DownloadManager* manager, QWidget* parent = nullptr);
 
 private slots:
-    void onBrowseClicked();
-    void onUrlChanged(const QString& url);
-    void onStartClicked();
-    void onNewDownloadWindow();
-
-    void onStarted(qint64 totalBytes, bool supportsRanges, int chunkCount,
-                   const QList<ChunkRow>& chunks);
-    void onProgressUpdated(qint64 received, qint64 total, double bytesPerSec,
-                           const QList<ChunkRow>& chunks);
-    void onFinished();
-    void onFailed(const QString& reason);
+    void onNewDownloadClicked();
+    void onPauseClicked();
+    void onResumeClicked();
+    void onCancelClicked();
+    void onRemoveClicked();
+    void onOpenFolderClicked();
+    void onDetailsClicked();
+    void onSelectionChanged();
+    void onRowDoubleClicked(const QModelIndex& index);
 
 private:
     void buildUi();
-    void buildMenuAndToolbar();
-    void applyProgressBarStyle(class QProgressBar* bar);
-    void setFormEnabled(bool enabled);
-    void refreshFilenameSuggestion(const QString& url);
-    QString resolveSaveName(const QString& userName, const QString& url) const;
+    void buildToolbarAndMenu();
+    void updateActionStates();
+    qint64 currentDownloadId() const;
+    void openDetailsFor(qint64 id);
 
-    // Form
-    QLineEdit* urlEdit_ = nullptr;
-    QLineEdit* dirEdit_ = nullptr;
-    QPushButton* browseBtn_ = nullptr;
-    QLineEdit* nameEdit_ = nullptr;
-    QPushButton* startBtn_ = nullptr;
+    fdm::store::DownloadManager* manager_;
+    fdm::store::DownloadListModel* model_ = nullptr;
+    QTableView* table_ = nullptr;
 
-    // Status
-    QLabel* statusLabel_ = nullptr;
-    QLabel* speedLabel_ = nullptr;
-    QProgressBar* overallBar_ = nullptr;
-    QTableWidget* chunkTable_ = nullptr;
+    QAction* newAction_ = nullptr;
+    QAction* pauseAction_ = nullptr;
+    QAction* resumeAction_ = nullptr;
+    QAction* cancelAction_ = nullptr;
+    QAction* removeAction_ = nullptr;
+    QAction* openFolderAction_ = nullptr;
+    QAction* detailsAction_ = nullptr;
 
-    EngineBridge* bridge_ = nullptr;
+    QHash<qint64, QPointer<DownloadDetailsWindow>> detailsWindows_;
 };
 
 }  // namespace fdm_gui

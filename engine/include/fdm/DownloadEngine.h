@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "fdm/ChunkSpec.h"
 #include "fdm/DownloadInfo.h"
 #include "fdm/EngineEvent.h"
 
@@ -17,10 +18,36 @@ namespace fdm {
 
 std::string engineVersion();
 
+// Opaque, monotonically increasing id used by callers to address a single
+// download for pause/resume/cancel. The engine's `start()` / `resumeKnown()`
+// returns one; values are unique within a single DownloadEngine instance.
+using DownloadId = std::int64_t;
+
 struct ProbeResult {
     bool ok = false;
     DownloadInfo info;
     std::string error;
+};
+
+// Per-chunk state for restoring a previously-interrupted download. Together
+// with the URL, output path, and total size this is everything the engine
+// needs to skip the probe/split step and pick up exactly where the last run
+// stopped.
+struct ChunkRestore {
+    int index = 0;
+    std::int64_t startByte = 0;
+    std::int64_t endByte = -1;
+    std::int64_t bytesReceived = 0;
+    int attempts = 1;
+    ChunkProgress::Status status = ChunkProgress::Status::Active;
+};
+
+struct ResumeSpec {
+    std::string url;
+    std::string outputPath;
+    std::int64_t totalBytes = -1;
+    bool supportsRanges = true;
+    std::vector<ChunkRestore> chunks;
 };
 
 // Attached to a curl easy handle via CURLOPT_PRIVATE. The engine reads this
@@ -59,9 +86,30 @@ public:
     // Start a chunked download. Emits Started, then Progress events, then
     // either Finished or Failed exactly once. All events fire on the engine
     // thread. Pre-allocates the output file when Content-Length is known.
-    void start(std::string url,
-               std::string outputPath,
-               std::function<void(EngineEvent)> onEvent);
+    // Returns the engine-assigned id used to address this download for
+    // pause/resume/cancel.
+    DownloadId start(std::string url,
+                     std::string outputPath,
+                     std::function<void(EngineEvent)> onEvent);
+
+    // Like start(), but skips probing and chunk-splitting -- the caller
+    // already knows the URL's metadata and each chunk's progress (typically
+    // from persistent storage). Behaves identically once running: emits
+    // Started, then Progress, then Finished or Failed exactly once.
+    DownloadId resumeKnown(ResumeSpec spec,
+                           std::function<void(EngineEvent)> onEvent);
+
+    // Pause one in-flight download (no-op if id is unknown / not active).
+    // Emits Paused. Chunks are removed from libcurl multi and any pending
+    // retries dropped.
+    void pause(DownloadId id);
+
+    // Resume a paused download in-process (no-op if not paused).
+    void resume(DownloadId id);
+
+    // Cancel one in-flight download. Emits Failed{"Cancelled"} and tears
+    // down. Does NOT touch the partial file on disk.
+    void cancel(DownloadId id);
 
     // Implementation-only nested types. Forward-declared here so private
     // members can reference them; full definitions live in DownloadEngine.cpp
@@ -71,12 +119,17 @@ public:
 
 private:
     void runLoop();
+    // Helpers shared by start() and resumeKnown(). Engine-thread-only.
+    DownloadState* findById(DownloadId id);
+    void launchTasks(DownloadState* state, const std::vector<ChunkSpec>& chunks,
+                     const std::vector<ChunkRestore>* restoreOverlay);
 
     CURLM* multi_ = nullptr;
     std::thread thread_;
     std::mutex mu_;
     std::deque<std::function<void()>> commands_;
     std::atomic<bool> stopRequested_{false};
+    std::atomic<DownloadId> nextId_{1};
     std::vector<PendingRetry> retries_;       // engine-thread-only
     std::vector<DownloadState*> activeStates_;  // engine-thread-only
 };

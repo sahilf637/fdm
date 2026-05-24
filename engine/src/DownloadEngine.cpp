@@ -171,10 +171,12 @@ std::size_t probeDiscardWrite(char*, std::size_t size, std::size_t nmemb, void* 
 // One in-flight download. Created when start() is called, deleted after the
 // terminal event (Finished or Failed) fires. Touched only from engine thread.
 struct DownloadEngine::DownloadState {
+    DownloadId id = 0;
     std::string url;
     std::string outputPath;
     std::function<void(EngineEvent)> onEvent;
     std::int64_t totalBytes = -1;
+    bool supportsRanges = false;
     int totalChunks = 0;
     int completedChunks = 0;
     int failedChunks = 0;
@@ -183,6 +185,7 @@ struct DownloadEngine::DownloadState {
     std::vector<ChunkProgress::Status> chunkStatuses;
     std::chrono::steady_clock::time_point lastProgressEmit{};
     std::int64_t lastEmitReceived = 0;
+    bool paused = false;
 
     void emit(EngineEvent ev) {
         if (onEvent) onEvent(std::move(ev));
@@ -269,6 +272,10 @@ DownloadEngine::~DownloadEngine() {
     stopRequested_.store(true, std::memory_order_release);
     if (multi_) curl_multi_wakeup(multi_);
     if (thread_.joinable()) thread_.join();
+    // Anything still in flight at shutdown belongs to abandoned downloads --
+    // free their resources so we don't leak open files / curl handles.
+    for (auto* state : activeStates_) delete state;
+    activeStates_.clear();
     if (multi_) curl_multi_cleanup(multi_);
 }
 
@@ -365,13 +372,150 @@ void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onR
     addEasy(state->easy);
 }
 
-void DownloadEngine::start(std::string url,
-                           std::string outputPath,
-                           std::function<void(EngineEvent)> onEvent) {
+DownloadEngine::DownloadState* DownloadEngine::findById(DownloadId id) {
+    for (auto* st : activeStates_) {
+        if (st->id == id) return st;
+    }
+    return nullptr;
+}
+
+// Build ChunkTasks, emit Started, register for periodic Progress emits, and
+// start each chunk on the multi handle. `restoreOverlay` carries per-chunk
+// resume state (bytesReceived, attempts, status) when restoring from disk;
+// nullptr means a fresh download. Caller already populated state->url,
+// outputPath, onEvent, totalBytes, id.
+void DownloadEngine::launchTasks(DownloadState* state,
+                                 const std::vector<ChunkSpec>& chunks,
+                                 const std::vector<ChunkRestore>* restoreOverlay) {
+    if (chunks.empty()) {
+        // Nothing to do (content-length 0). Emit a tidy Started + Finished
+        // pair so callers can tear down without special-casing.
+        state->emit(Started{state->totalBytes, state->supportsRanges, 0, {}});
+        state->emit(Finished{});
+        delete state;
+        return;
+    }
+
+    state->totalChunks = static_cast<int>(chunks.size());
+    state->chunkStatuses.assign(chunks.size(), ChunkProgress::Status::Active);
+
+    // Pre-apply restore status so a chunk that finished in a previous session
+    // doesn't kick off a new request, and the initial Started already shows
+    // the right state to the UI.
+    int alreadyDone = 0;
+    if (restoreOverlay) {
+        for (const auto& r : *restoreOverlay) {
+            if (r.index >= 0 && r.index < state->totalChunks) {
+                state->chunkStatuses[r.index] = r.status;
+                if (r.status == ChunkProgress::Status::Done) alreadyDone++;
+            }
+        }
+        state->completedChunks = alreadyDone;
+    }
+
+    state->emit(Started{state->totalBytes, state->supportsRanges,
+                        state->totalChunks, chunks});
+
+    try {
+        for (const auto& spec : chunks) {
+            std::int64_t initBytes = 0;
+            int initAttempts = 1;
+            if (restoreOverlay && spec.index < static_cast<int>(restoreOverlay->size())) {
+                const auto& r = (*restoreOverlay)[spec.index];
+                if (r.index == spec.index) {
+                    initBytes = r.bytesReceived;
+                    initAttempts = r.attempts;
+                }
+            }
+            state->tasks.push_back(std::make_unique<ChunkTask>(
+                state->url, state->outputPath, spec, initBytes, initAttempts));
+        }
+    } catch (const std::exception& e) {
+        state->emit(Failed{e.what()});
+        delete state;
+        return;
+    }
+
+    // Register for periodic progress emits from runLoop. Initialise the
+    // timer to "now" so the first emit fires ~kProgressInterval from here
+    // rather than instantly (which would be a redundant 0% Progress).
+    state->lastProgressEmit = std::chrono::steady_clock::now();
+    state->lastEmitReceived = sumReceived(*state);
+    activeStates_.push_back(state);
+
+    // If every chunk was already Done in the restore overlay, the download
+    // is already complete -- emit Finished and tear down without starting
+    // any requests.
+    if (state->completedChunks == state->totalChunks) {
+        state->emit(Finished{});
+        auto it = std::find(activeStates_.begin(), activeStates_.end(), state);
+        if (it != activeStates_.end()) activeStates_.erase(it);
+        delete state;
+        return;
+    }
+
+    for (std::size_t i = 0; i < state->tasks.size(); ++i) {
+        if (state->chunkStatuses[i] == ChunkProgress::Status::Done) continue;
+        ChunkTask* taskPtr = state->tasks[i].get();
+        taskPtr->start(*this, [this, state, taskPtr](CURLcode rc) {
+            long http = 0;
+            curl_easy_getinfo(taskPtr->easy(), CURLINFO_RESPONSE_CODE, &http);
+            const int idx = taskPtr->spec().index;
+
+            if (rc == CURLE_OK) {
+                state->completedChunks++;
+                state->chunkStatuses[idx] = ChunkProgress::Status::Done;
+            } else if (classifyError(rc, http) == RetryDecision::Retry &&
+                       taskPtr->prepareRetry()) {
+                // Stays Status::Active -- the chunk is still in flight via
+                // the retries_ queue; the UI sees this as "retrying" via
+                // the attempts counter going up.
+                const int retryAttempt = taskPtr->attempts() - 1;
+                retries_.push_back(PendingRetry{
+                    taskPtr->easy(),
+                    std::chrono::steady_clock::now() + backoffFor(retryAttempt)});
+                return;
+            } else {
+                state->failedChunks++;
+                state->chunkStatuses[idx] = ChunkProgress::Status::Failed;
+                if (state->firstError.empty()) {
+                    state->firstError = describeError(rc, http);
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const std::int64_t received = sumReceived(*state);
+
+            if (state->completedChunks + state->failedChunks == state->totalChunks) {
+                if (state->failedChunks == 0) {
+                    const double rate = computeBytesPerSec(*state, received, now);
+                    state->emit(Progress{received, state->totalBytes, rate,
+                                         snapshotChunks(*state)});
+                    state->emit(Finished{});
+                } else {
+                    state->emit(Failed{state->firstError});
+                }
+                auto it = std::find(activeStates_.begin(), activeStates_.end(), state);
+                if (it != activeStates_.end()) activeStates_.erase(it);
+                delete state;
+            } else if (now - state->lastProgressEmit >= kProgressInterval) {
+                const double rate = computeBytesPerSec(*state, received, now);
+                state->emit(Progress{received, state->totalBytes, rate,
+                                     snapshotChunks(*state)});
+            }
+        });
+    }
+}
+
+DownloadId DownloadEngine::start(std::string url,
+                                 std::string outputPath,
+                                 std::function<void(EngineEvent)> onEvent) {
     auto* state = new DownloadState();
+    state->id = nextId_.fetch_add(1, std::memory_order_relaxed);
     state->url = std::move(url);
     state->outputPath = std::move(outputPath);
     state->onEvent = std::move(onEvent);
+    const DownloadId id = state->id;
 
     probe(state->url, [this, state](ProbeResult pr) {
         if (!pr.ok) {
@@ -381,6 +525,7 @@ void DownloadEngine::start(std::string url,
         }
 
         state->totalBytes = pr.info.contentLength;
+        state->supportsRanges = pr.info.supportsRanges;
 
         std::string err;
         if (!preallocateFile(state->outputPath, pr.info.contentLength, &err)) {
@@ -394,88 +539,38 @@ void DownloadEngine::start(std::string url,
             chunks.push_back(ChunkSpec{0, -1, 0});
         } else {
             chunks = splitIntoChunks(pr.info.contentLength, kMaxChunks, kMinChunkSize);
-            if (chunks.empty()) {
-                state->emit(Started{0, pr.info.supportsRanges, 0, {}});
-                state->emit(Finished{});
-                delete state;
-                return;
-            }
         }
-
-        state->totalChunks = static_cast<int>(chunks.size());
-        state->chunkStatuses.assign(chunks.size(), ChunkProgress::Status::Active);
-        state->emit(Started{pr.info.contentLength, pr.info.supportsRanges,
-                            state->totalChunks, chunks});
-
-        try {
-            for (const auto& spec : chunks) {
-                state->tasks.push_back(
-                    std::make_unique<ChunkTask>(state->url, state->outputPath, spec));
-            }
-        } catch (const std::exception& e) {
-            state->emit(Failed{e.what()});
-            delete state;
-            return;
-        }
-
-        // Register for periodic progress emits from runLoop. Initialise the
-        // timer to "now" so the first emit fires ~kProgressInterval from here
-        // rather than instantly (which would be a redundant 0% Progress).
-        state->lastProgressEmit = std::chrono::steady_clock::now();
-        state->lastEmitReceived = 0;
-        activeStates_.push_back(state);
-
-        for (auto& task : state->tasks) {
-            ChunkTask* taskPtr = task.get();
-            taskPtr->start(*this, [this, state, taskPtr](CURLcode rc) {
-                long http = 0;
-                curl_easy_getinfo(taskPtr->easy(), CURLINFO_RESPONSE_CODE, &http);
-                const int idx = taskPtr->spec().index;
-
-                if (rc == CURLE_OK) {
-                    state->completedChunks++;
-                    state->chunkStatuses[idx] = ChunkProgress::Status::Done;
-                } else if (classifyError(rc, http) == RetryDecision::Retry &&
-                           taskPtr->prepareRetry()) {
-                    // Stays Status::Active -- the chunk is still in flight via
-                    // the retries_ queue; the UI sees this as "retrying" via
-                    // the attempts counter going up.
-                    const int retryAttempt = taskPtr->attempts() - 1;  // 1 for first retry
-                    retries_.push_back(PendingRetry{
-                        taskPtr->easy(),
-                        std::chrono::steady_clock::now() + backoffFor(retryAttempt)});
-                    return;  // not terminal for this chunk yet
-                } else {
-                    state->failedChunks++;
-                    state->chunkStatuses[idx] = ChunkProgress::Status::Failed;
-                    if (state->firstError.empty()) {
-                        state->firstError = describeError(rc, http);
-                    }
-                }
-
-                const auto now = std::chrono::steady_clock::now();
-                const std::int64_t received = sumReceived(*state);
-
-                if (state->completedChunks + state->failedChunks == state->totalChunks) {
-                    if (state->failedChunks == 0) {
-                        const double rate = computeBytesPerSec(*state, received, now);
-                        state->emit(Progress{received, state->totalBytes, rate,
-                                             snapshotChunks(*state)});
-                        state->emit(Finished{});
-                    } else {
-                        state->emit(Failed{state->firstError});
-                    }
-                    auto it = std::find(activeStates_.begin(), activeStates_.end(), state);
-                    if (it != activeStates_.end()) activeStates_.erase(it);
-                    delete state;
-                } else if (now - state->lastProgressEmit >= kProgressInterval) {
-                    const double rate = computeBytesPerSec(*state, received, now);
-                    state->emit(Progress{received, state->totalBytes, rate,
-                                         snapshotChunks(*state)});
-                }
-            });
-        }
+        launchTasks(state, chunks, /*restoreOverlay=*/nullptr);
     });
+    return id;
+}
+
+DownloadId DownloadEngine::resumeKnown(ResumeSpec spec,
+                                       std::function<void(EngineEvent)> onEvent) {
+    auto* state = new DownloadState();
+    state->id = nextId_.fetch_add(1, std::memory_order_relaxed);
+    state->url = std::move(spec.url);
+    state->outputPath = std::move(spec.outputPath);
+    state->onEvent = std::move(onEvent);
+    state->totalBytes = spec.totalBytes;
+    state->supportsRanges = spec.supportsRanges;
+    const DownloadId id = state->id;
+
+    // Hop to the engine thread so libcurl / activeStates_ access is single-
+    // threaded just like every other entry point.
+    std::vector<ChunkRestore> restore = std::move(spec.chunks);
+    post([this, state, restore = std::move(restore)]() mutable {
+        // Build ChunkSpecs from the restore overlay so chunk-task indices stay
+        // aligned. We trust the caller's split -- the partial file on disk was
+        // sized for it.
+        std::vector<ChunkSpec> chunks;
+        chunks.reserve(restore.size());
+        for (const auto& r : restore) {
+            chunks.push_back(ChunkSpec{r.startByte, r.endByte, r.index});
+        }
+        launchTasks(state, chunks, &restore);
+    });
+    return id;
 }
 
 void DownloadEngine::runLoop() {
@@ -517,10 +612,12 @@ void DownloadEngine::runLoop() {
 
         // Periodic Progress for every active download. Independent of chunk
         // completion so the UI sees smooth byte-level updates instead of one
-        // jump per chunk.
+        // jump per chunk. Paused downloads are skipped -- their bytes aren't
+        // advancing so a Progress would just look like a stalled stream.
         {
             const auto progNow = std::chrono::steady_clock::now();
             for (auto* st : activeStates_) {
+                if (st->paused) continue;
                 if (progNow - st->lastProgressEmit >= kProgressInterval) {
                     const std::int64_t r = sumReceived(*st);
                     const double rate = computeBytesPerSec(*st, r, progNow);
@@ -542,6 +639,84 @@ void DownloadEngine::runLoop() {
         }
         curl_multi_poll(multi_, nullptr, 0, static_cast<int>(pollMs), nullptr);
     }
+}
+
+namespace {
+
+// True if `r` belongs to one of `state`'s chunks (used when filtering the
+// retry queue during pause/cancel).
+bool retryBelongsTo(const DownloadEngine::PendingRetry& r,
+                    const DownloadEngine::DownloadState& state) {
+    for (const auto& t : state.tasks) {
+        if (t->easy() == r.easy) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+void DownloadEngine::pause(DownloadId id) {
+    post([this, id] {
+        auto* state = findById(id);
+        if (!state || state->paused) return;
+        for (auto& task : state->tasks) {
+            // remove is a no-op for handles already off the multi (e.g.,
+            // chunks that have completed) -- safe.
+            curl_multi_remove_handle(multi_, task->easy());
+        }
+        retries_.erase(
+            std::remove_if(retries_.begin(), retries_.end(),
+                           [state](const PendingRetry& r) {
+                               return retryBelongsTo(r, *state);
+                           }),
+            retries_.end());
+        state->paused = true;
+        state->emit(Paused{});
+    });
+}
+
+void DownloadEngine::resume(DownloadId id) {
+    post([this, id] {
+        auto* state = findById(id);
+        if (!state || !state->paused) return;
+        for (std::size_t i = 0; i < state->tasks.size(); ++i) {
+            const auto status = state->chunkStatuses[i];
+            if (status != ChunkProgress::Status::Active) continue;
+            auto& task = state->tasks[i];
+            if (!task->reconfigureForResume()) {
+                // Already fully received -- mark Done.
+                state->chunkStatuses[i] = ChunkProgress::Status::Done;
+                state->completedChunks++;
+                continue;
+            }
+            curl_multi_add_handle(multi_, task->easy());
+        }
+        state->paused = false;
+        // Reset the speed baseline so we don't show a huge spike from the
+        // pause window.
+        state->lastProgressEmit = std::chrono::steady_clock::now();
+        state->lastEmitReceived = sumReceived(*state);
+    });
+}
+
+void DownloadEngine::cancel(DownloadId id) {
+    post([this, id] {
+        auto* state = findById(id);
+        if (!state) return;
+        for (auto& task : state->tasks) {
+            curl_multi_remove_handle(multi_, task->easy());
+        }
+        retries_.erase(
+            std::remove_if(retries_.begin(), retries_.end(),
+                           [state](const PendingRetry& r) {
+                               return retryBelongsTo(r, *state);
+                           }),
+            retries_.end());
+        state->emit(Failed{"Cancelled"});
+        auto it = std::find(activeStates_.begin(), activeStates_.end(), state);
+        if (it != activeStates_.end()) activeStates_.erase(it);
+        delete state;
+    });
 }
 
 }  // namespace fdm

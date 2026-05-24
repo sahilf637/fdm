@@ -10,6 +10,7 @@
 #include <variant>
 
 #include "fdm/DownloadEngine.h"
+#include "fdm/Paths.h"
 
 namespace {
 
@@ -63,8 +64,14 @@ int runDownload(const char* url, const char* outputPath) {
         std::string name = filenameFromUrl(url);
         if (name.empty()) name = "download.bin";
         out /= name;
-        std::fprintf(stderr, "writing to %s\n", out.c_str());
     }
+    const std::string finalPath = fdm::findAvailablePath(out.string());
+    if (finalPath != out.string()) {
+        std::fprintf(stderr, "file exists, saving as %s\n", finalPath.c_str());
+    } else if (out.string() != outputPath) {
+        std::fprintf(stderr, "writing to %s\n", finalPath.c_str());
+    }
+    out = finalPath;
 
     fdm::DownloadEngine engine;
 

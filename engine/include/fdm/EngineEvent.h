@@ -41,6 +41,8 @@ struct Failed {
     std::string reason;
 };
 
-using EngineEvent = std::variant<Started, Progress, Finished, Failed>;
+struct Paused {};
+
+using EngineEvent = std::variant<Started, Progress, Finished, Failed, Paused>;
 
 }  // namespace fdm

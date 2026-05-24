@@ -13,8 +13,13 @@
 
 namespace fdm {
 
-ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec)
-    : url_(std::move(url)), outputPath_(std::move(outputPath)), spec_(spec) {
+ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
+                     std::int64_t initialBytesReceived, int initialAttempts)
+    : url_(std::move(url)),
+      outputPath_(std::move(outputPath)),
+      spec_(spec),
+      bytesWrittenSoFar_(initialBytesReceived),
+      attempts_(initialAttempts < 1 ? 1 : initialAttempts) {
     const int fd = ::open(outputPath_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
         throw std::runtime_error(std::string("open ") + outputPath_ + ": " +
@@ -26,7 +31,10 @@ ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec)
         ::close(fd);
         throw std::runtime_error(std::string("fdopen: ") + std::strerror(err));
     }
-    if (::fseeko(file_, static_cast<off_t>(spec_.startByte), SEEK_SET) != 0) {
+    // Seek to where the next byte will be written -- chunk start plus any
+    // bytes already on disk from a previous run.
+    const std::int64_t writeOffset = spec_.startByte + bytesWrittenSoFar_;
+    if (::fseeko(file_, static_cast<off_t>(writeOffset), SEEK_SET) != 0) {
         const int err = errno;
         std::fclose(file_);
         file_ = nullptr;
@@ -42,7 +50,7 @@ ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec)
 
     curl_easy_setopt(easy_, CURLOPT_URL, url_.c_str());
     if (spec_.endByte >= 0) {
-        const std::string range = std::to_string(spec_.startByte) + "-" +
+        const std::string range = std::to_string(writeOffset) + "-" +
                                   std::to_string(spec_.endByte);
         curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
     }
@@ -94,6 +102,17 @@ bool ChunkTask::prepareRetry() {
         curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
     }
     // ctx_ (and thus CURLOPT_PRIVATE) is still valid; the same onDone fires.
+    return true;
+}
+
+bool ChunkTask::reconfigureForResume() {
+    const std::int64_t resumeStart = spec_.startByte + bytesWrittenSoFar_;
+    if (spec_.endByte >= 0) {
+        if (resumeStart > spec_.endByte) return false;
+        const std::string range = std::to_string(resumeStart) + "-" +
+                                  std::to_string(spec_.endByte);
+        curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
+    }
     return true;
 }
 
