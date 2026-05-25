@@ -148,6 +148,24 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath) 
     return id;
 }
 
+void DownloadManager::probe(const QString& url,
+                            std::function<void(ProbeResult)> onResult) {
+    engine_->probe(
+        url.toStdString(),
+        [this, cb = std::move(onResult)](fdm::ProbeResult pr) {
+            ProbeResult ui;
+            ui.ok = pr.ok;
+            ui.error = QString::fromStdString(pr.error);
+            ui.finalUrl = QString::fromStdString(pr.info.finalUrl);
+            ui.suggestedFilename = QString::fromStdString(pr.info.suggestedFilename);
+            ui.contentLength = pr.info.contentLength;
+            ui.supportsRanges = pr.info.supportsRanges;
+            // Hop back to the UI thread (= the thread this QObject lives on).
+            QMetaObject::invokeMethod(
+                this, [cb, ui]() { cb(ui); }, Qt::QueuedConnection);
+        });
+}
+
 fdm::ResumeSpec DownloadManager::buildResumeSpec(const DownloadLiveRow& row) const {
     fdm::ResumeSpec spec;
     spec.url = row.rec.url.toStdString();
@@ -223,6 +241,41 @@ void DownloadManager::resume(qint64 id) {
     emit rowChanged(id);
     row->engineId = engine_->resumeKnown(
         std::move(spec), [this, id](fdm::EngineEvent ev) {
+            QMetaObject::invokeMethod(
+                this, [this, id, ev = std::move(ev)]() mutable {
+                    onEngineEvent(id, std::move(ev));
+                },
+                Qt::QueuedConnection);
+        });
+}
+
+void DownloadManager::retry(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+    if (row->engineId != 0) {
+        engine_->cancel(row->engineId);
+        row->engineId = 0;
+    }
+    // Reset live state and DB metadata so the upcoming engine.start() begins
+    // from a clean slate. The engine's preallocateFile uses O_TRUNC, so the
+    // existing partial file is overwritten -- no manual file removal needed.
+    row->chunks.clear();
+    row->bytesReceived = 0;
+    row->bytesPerSec = 0;
+    row->rec.totalBytes = -1;
+    row->rec.supportsRanges = false;
+    row->rec.status = DownloadStatus::Active;
+    row->rec.error.clear();
+
+    db_->updateDownloadStatus(id, DownloadStatus::Active);
+    db_->updateDownloadTotals(id, -1, false);
+    db_->replaceChunks(id, {});
+    lastPersistMs_.remove(id);
+    emit rowChanged(id);
+
+    row->engineId = engine_->start(
+        row->rec.url.toStdString(), row->rec.outputPath.toStdString(),
+        [this, id](fdm::EngineEvent ev) {
             QMetaObject::invokeMethod(
                 this, [this, id, ev = std::move(ev)]() mutable {
                     onEngineEvent(id, std::move(ev));

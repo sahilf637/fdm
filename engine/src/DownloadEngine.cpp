@@ -90,7 +90,113 @@ struct HeaderState {
     std::int64_t contentLength = -1;       // populated from "Content-Length:" (200 path)
     std::int64_t contentRangeTotal = -1;   // populated from "Content-Range: bytes A-B/TOTAL" (206 path)
     bool acceptRanges = false;             // populated from "Accept-Ranges: bytes"
+    std::string suggestedFilename;         // populated from Content-Disposition
 };
+
+// Strip path separators and control characters: a server cannot be trusted
+// to send a clean leaf filename. (RFC 6266 says treat the value as a "bare
+// filename" -- no path components.)
+std::string sanitizeFilename(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '/' || c == '\\') continue;
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) continue;
+        out += c;
+    }
+    return out;
+}
+
+int hexValue(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+// Decode RFC 5987 ext-value: "charset'lang'percent-encoded-value".
+// We treat the bytes as UTF-8 -- legal RFC 5987 charsets in practice are
+// just UTF-8 (and the obsolete ISO-8859-1), and we hand the bytes to
+// std::string callers either way. Returns empty on malformed input.
+std::string decodeRfc5987(const std::string& raw) {
+    const std::size_t firstTick = raw.find('\'');
+    if (firstTick == std::string::npos) return {};
+    const std::size_t secondTick = raw.find('\'', firstTick + 1);
+    if (secondTick == std::string::npos) return {};
+    const std::string encoded = raw.substr(secondTick + 1);
+
+    std::string out;
+    out.reserve(encoded.size());
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        const char c = encoded[i];
+        if (c == '%' && i + 2 < encoded.size()) {
+            const int hi = hexValue(encoded[i + 1]);
+            const int lo = hexValue(encoded[i + 2]);
+            if (hi < 0 || lo < 0) return {};
+            out += static_cast<char>((hi << 4) | lo);
+            i += 2;
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// Read a Content-Disposition value and return the best filename found, or
+// "" if none. Prefers filename*= (RFC 5987, non-ASCII-safe) over filename=.
+// Tolerant: handles quoted and unquoted values, ignores unrecognized params,
+// case-insensitive parameter names, RFC 2616 LWS around `=` and `;`.
+std::string extractDispositionFilename(const char* p, const char* end) {
+    std::string filename;
+    std::string filenameStar;
+
+    auto skipWs = [&]() { while (p < end && (*p == ' ' || *p == '\t')) ++p; };
+
+    // Disposition type ("attachment", "inline", ...). Skip until ';' or EOL.
+    while (p < end && *p != ';') ++p;
+
+    while (p < end) {
+        if (*p == ';') ++p;
+        skipWs();
+        // Parse parameter name (until '=').
+        const char* nameStart = p;
+        while (p < end && *p != '=' && *p != ';') ++p;
+        if (p >= end || *p != '=') break;
+        const char* nameEnd = p;
+        // Trim trailing whitespace on name.
+        while (nameEnd > nameStart && (*(nameEnd - 1) == ' ' || *(nameEnd - 1) == '\t')) --nameEnd;
+        ++p;  // consume '='
+        skipWs();
+
+        // Parse parameter value: quoted-string or token.
+        std::string value;
+        if (p < end && *p == '"') {
+            ++p;
+            while (p < end && *p != '"') {
+                if (*p == '\\' && p + 1 < end) { value += *(p + 1); p += 2; }
+                else { value += *p; ++p; }
+            }
+            if (p < end) ++p;  // consume closing quote
+        } else {
+            while (p < end && *p != ';' && *p != ' ' && *p != '\t') {
+                value += *p;
+                ++p;
+            }
+        }
+
+        const std::size_t nameLen = nameEnd - nameStart;
+        if (nameLen == 9 && strncasecmp(nameStart, "filename*", 9) == 0) {
+            std::string decoded = decodeRfc5987(value);
+            if (!decoded.empty()) filenameStar = std::move(decoded);
+        } else if (nameLen == 8 && strncasecmp(nameStart, "filename", 8) == 0) {
+            filename = std::move(value);
+        }
+        skipWs();
+    }
+
+    std::string raw = !filenameStar.empty() ? filenameStar : filename;
+    return sanitizeFilename(std::move(raw));
+}
 
 bool startsWithCI(const char* s, std::size_t slen, const char* prefix) {
     const std::size_t plen = std::strlen(prefix);
@@ -124,6 +230,10 @@ std::size_t headerCallback(char* buf, std::size_t size, std::size_t nmemb, void*
         if (equalsCI(p, len - (p - buf), "bytes")) {
             st->acceptRanges = true;
         }
+    } else if (startsWithCI(buf, len, "content-disposition:")) {
+        const char* p = skipValueWhitespace(buf + std::strlen("content-disposition:"), buf + len);
+        std::string fn = extractDispositionFilename(p, buf + len);
+        if (!fn.empty()) st->suggestedFilename = std::move(fn);
     } else if (startsWithCI(buf, len, "content-range:")) {
         // Format: "Content-Range: bytes 0-0/12345" or ".../*"
         const char* p = skipValueWhitespace(buf + std::strlen("content-range:"), buf + len);
@@ -333,6 +443,7 @@ void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onR
             result.ok = true;
             result.info.supportsRanges = supportsRanges;
             result.info.contentLength = length;
+            result.info.suggestedFilename = state->header.suggestedFilename;
             char* eff = nullptr;
             curl_easy_getinfo(state->easy, CURLINFO_EFFECTIVE_URL, &eff);
             if (eff) result.info.finalUrl = eff;

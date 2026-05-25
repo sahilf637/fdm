@@ -6,6 +6,7 @@
 #include <QString>
 #include <QtGlobal>
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -14,6 +15,17 @@
 #include "fdm/store/Database.h"
 
 namespace fdm::store {
+
+// Qt-flavoured view of fdm::ProbeResult. Strings are QStrings so UI code
+// can use them without round-tripping through std::string.
+struct ProbeResult {
+    bool ok = false;
+    QString error;
+    QString finalUrl;            // post-redirect URL
+    QString suggestedFilename;   // server's Content-Disposition, sanitized
+    qint64 contentLength = -1;
+    bool supportsRanges = false;
+};
 
 // In-memory live row: a persisted DownloadRecord plus the volatile, runtime-
 // only fields the engine pushes (current sum-of-bytes, smoothed speed, last
@@ -50,11 +62,20 @@ public:
     // Insert a row in the DB and start it in the engine. Returns the new id.
     qint64 startNew(const QString& url, const QString& outputPath);
 
+    // Probe a URL without registering a download. Callback fires on the UI
+    // thread (the same thread `this` lives on). Useful for filling in a
+    // server-suggested filename before the user commits to a save path.
+    void probe(const QString& url, std::function<void(ProbeResult)> onResult);
+
     // Engine-control operations. All are id-addressed and idempotent: e.g.
     // pause() of an already-paused download is a no-op.
     void pause(qint64 id);
-    void resume(qint64 id);   // works for Paused; also restarts Failed.
+    void resume(qint64 id);   // continues a Paused download from saved chunks.
     void cancel(qint64 id);
+    // Restart from byte zero -- drops chunk progress, clears errors, calls
+    // engine.start() fresh. Use when the prior attempt failed in a way
+    // resume can't recover from.
+    void retry(qint64 id);
     // Remove from DB. `alsoRemoveFile` deletes the (possibly partial) file
     // on disk too. If the download is currently active, it is cancelled
     // first.

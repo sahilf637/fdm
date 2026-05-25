@@ -2,9 +2,12 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QDesktopServices>
+#include <QDir>
 #include <QFileInfo>
 #include <QHeaderView>
+#include <QIcon>
 #include <QKeySequence>
 #include <QMenu>
 #include <QMenuBar>
@@ -62,6 +65,10 @@ void MainWindow::buildUi() {
             &MainWindow::onSelectionChanged);
     connect(table_, &QTableView::doubleClicked, this, &MainWindow::onRowDoubleClicked);
 
+    table_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(table_, &QTableView::customContextMenuRequested, this,
+            &MainWindow::onTableContextMenu);
+
     setCentralWidget(table_);
 }
 
@@ -79,6 +86,14 @@ void MainWindow::buildToolbarAndMenu() {
 
     cancelAction_ = new QAction(style()->standardIcon(QStyle::SP_MediaStop), "&Cancel", this);
     connect(cancelAction_, &QAction::triggered, this, &MainWindow::onCancelClicked);
+
+    retryAction_ = new QAction(style()->standardIcon(QStyle::SP_BrowserReload),
+                               "Re&try", this);
+    connect(retryAction_, &QAction::triggered, this, &MainWindow::onRetryClicked);
+
+    redownloadAction_ = new QAction(style()->standardIcon(QStyle::SP_DialogSaveButton),
+                                    "Re&download…", this);
+    connect(redownloadAction_, &QAction::triggered, this, &MainWindow::onRedownloadClicked);
 
     removeAction_ = new QAction(style()->standardIcon(QStyle::SP_TrashIcon),
                                 "Re&move from list", this);
@@ -105,6 +120,9 @@ void MainWindow::buildToolbarAndMenu() {
     dlMenu->addAction(resumeAction_);
     dlMenu->addAction(cancelAction_);
     dlMenu->addSeparator();
+    dlMenu->addAction(retryAction_);
+    dlMenu->addAction(redownloadAction_);
+    dlMenu->addSeparator();
     dlMenu->addAction(detailsAction_);
     dlMenu->addAction(openFolderAction_);
     dlMenu->addSeparator();
@@ -118,6 +136,8 @@ void MainWindow::buildToolbarAndMenu() {
     toolbar->addAction(pauseAction_);
     toolbar->addAction(resumeAction_);
     toolbar->addAction(cancelAction_);
+    toolbar->addAction(retryAction_);
+    toolbar->addAction(redownloadAction_);
     toolbar->addSeparator();
     toolbar->addAction(detailsAction_);
     toolbar->addAction(openFolderAction_);
@@ -136,6 +156,8 @@ void MainWindow::updateActionStates() {
         pauseAction_->setEnabled(false);
         resumeAction_->setEnabled(false);
         cancelAction_->setEnabled(false);
+        retryAction_->setEnabled(false);
+        redownloadAction_->setEnabled(false);
         removeAction_->setEnabled(false);
         openFolderAction_->setEnabled(false);
         detailsAction_->setEnabled(false);
@@ -146,9 +168,12 @@ void MainWindow::updateActionStates() {
     const bool active = row->rec.status == DownloadStatus::Active;
     const bool paused = row->rec.status == DownloadStatus::Paused;
     const bool failed = row->rec.status == DownloadStatus::Failed;
+    const bool completed = row->rec.status == DownloadStatus::Completed;
     pauseAction_->setEnabled(active);
-    resumeAction_->setEnabled(paused || failed);
+    resumeAction_->setEnabled(paused);
     cancelAction_->setEnabled(active || paused);
+    retryAction_->setEnabled(failed);
+    redownloadAction_->setEnabled(failed || completed);
     removeAction_->setEnabled(true);
     openFolderAction_->setEnabled(true);
     detailsAction_->setEnabled(true);
@@ -164,7 +189,7 @@ void MainWindow::onRowDoubleClicked(const QModelIndex& index) {
 }
 
 void MainWindow::onNewDownloadClicked() {
-    NewDownloadDialog dlg(this);
+    NewDownloadDialog dlg(manager_, this);
     if (dlg.exec() != QDialog::Accepted) return;
     const QString url = dlg.url();
     const QString path = dlg.outputPath();
@@ -195,6 +220,36 @@ void MainWindow::onCancelClicked() {
     if (id != 0) manager_->cancel(id);
 }
 
+void MainWindow::onRetryClicked() {
+    const qint64 id = currentDownloadId();
+    if (id != 0) manager_->retry(id);
+}
+
+void MainWindow::onRedownloadClicked() {
+    const qint64 id = currentDownloadId();
+    if (id != 0) redownloadFromRow(id);
+}
+
+void MainWindow::redownloadFromRow(qint64 id) {
+    const auto row = manager_->row(id);
+    if (!row) return;
+    const QFileInfo fi(row->rec.outputPath);
+
+    NewDownloadDialog dlg(manager_, this);
+    dlg.prefill(row->rec.url, fi.absolutePath(), fi.fileName());
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString url = dlg.url();
+    const QString path = dlg.outputPath();
+    if (url.isEmpty() || path.isEmpty()) return;
+
+    const qint64 newId = manager_->startNew(url, path);
+    statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()), 4000);
+    const int newRow = model_->rowCount() - 1;
+    if (newRow >= 0 && model_->idForRow(newRow) == newId) {
+        table_->selectRow(newRow);
+    }
+}
+
 void MainWindow::onRemoveClicked() {
     const qint64 id = currentDownloadId();
     if (id == 0) return;
@@ -202,19 +257,25 @@ void MainWindow::onRemoveClicked() {
     if (!row) return;
 
     QMessageBox box(this);
+    box.setIcon(QMessageBox::Question);
     box.setWindowTitle("Remove download");
     box.setText(QString("Remove '%1' from the list?")
                     .arg(QFileInfo(row->rec.outputPath).fileName()));
-    QAbstractButton* listOnly =
-        box.addButton("Remove from list", QMessageBox::AcceptRole);
-    QAbstractButton* alsoFile = box.addButton("Remove from list and delete file",
-                                              QMessageBox::DestructiveRole);
-    box.addButton(QMessageBox::Cancel);
+
+    auto* alsoDeleteFile = new QCheckBox("Also delete the downloaded file");
+    box.setCheckBox(alsoDeleteFile);
+
+    QAbstractButton* removeBtn = box.addButton("Remove", QMessageBox::AcceptRole);
+    QAbstractButton* cancelBtn = box.addButton("Cancel", QMessageBox::RejectRole);
+    // QMessageBox auto-assigns themed icons to buttons based on their role,
+    // which gives the Cancel button a red-X icon on KDE/Breeze. Strip it so
+    // the dialog reads as text-only.
+    cancelBtn->setIcon(QIcon());
+    removeBtn->setIcon(QIcon());
+
     box.exec();
-    if (box.clickedButton() == listOnly) {
-        manager_->remove(id, /*alsoRemoveFile=*/false);
-    } else if (box.clickedButton() == alsoFile) {
-        manager_->remove(id, /*alsoRemoveFile=*/true);
+    if (box.clickedButton() == removeBtn) {
+        manager_->remove(id, alsoDeleteFile->isChecked());
     }
 }
 
@@ -247,7 +308,76 @@ void MainWindow::openDetailsFor(qint64 id) {
     connect(w, &QObject::destroyed, this, [this, id]() {
         detailsWindows_.remove(id);
     });
+    // Queued connection: lets the details window finish closing before we
+    // pop the completion modal, so the modal lands against MainWindow
+    // instead of stacking over a window that's about to disappear.
+    connect(w, &DownloadDetailsWindow::downloadCompleted, this,
+            &MainWindow::onDownloadCompleted, Qt::QueuedConnection);
     w->show();
+}
+
+void MainWindow::onDownloadCompleted(qint64 id) {
+    const auto row = manager_->row(id);
+    if (!row) return;
+    const QString path = row->rec.outputPath;
+    const QString filename = QFileInfo(path).fileName();
+
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Information);
+    box.setWindowTitle("Download complete");
+    box.setText(QString("'%1' finished downloading.").arg(filename));
+    QAbstractButton* openFile =
+        box.addButton("Open file", QMessageBox::ActionRole);
+    QAbstractButton* showFolder =
+        box.addButton("Show in folder", QMessageBox::ActionRole);
+    QAbstractButton* closeBtn = box.addButton("Close", QMessageBox::RejectRole);
+    openFile->setIcon(QIcon());
+    showFolder->setIcon(QIcon());
+    closeBtn->setIcon(QIcon());
+
+    // Pop in front + grab focus before entering the modal event loop.
+    box.show();
+    box.raise();
+    box.activateWindow();
+    box.exec();
+
+    if (box.clickedButton() == openFile) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+    } else if (box.clickedButton() == showFolder) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(path).absolutePath()));
+    }
+}
+
+void MainWindow::onTableContextMenu(const QPoint& pos) {
+    // Select the row under the cursor first so action enabled-states match
+    // what the menu is about to act on. customContextMenuRequested delivers
+    // pos in viewport coordinates.
+    const QModelIndex idx = table_->indexAt(pos);
+    if (idx.isValid()) {
+        table_->selectRow(idx.row());
+    } else {
+        table_->clearSelection();
+    }
+
+    QMenu menu(this);
+    if (currentDownloadId() == 0) {
+        // No row clicked -- offer the only action that makes sense in empty
+        // space.
+        menu.addAction(newAction_);
+    } else {
+        menu.addAction(pauseAction_);
+        menu.addAction(resumeAction_);
+        menu.addAction(cancelAction_);
+        menu.addSeparator();
+        menu.addAction(retryAction_);
+        menu.addAction(redownloadAction_);
+        menu.addSeparator();
+        menu.addAction(detailsAction_);
+        menu.addAction(openFolderAction_);
+        menu.addSeparator();
+        menu.addAction(removeAction_);
+    }
+    menu.exec(table_->viewport()->mapToGlobal(pos));
 }
 
 }  // namespace fdm_gui

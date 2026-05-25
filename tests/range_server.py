@@ -6,6 +6,7 @@ import http.server
 import os
 import re
 import sys
+from urllib.parse import unquote
 
 
 class RangeHandler(http.server.BaseHTTPRequestHandler):
@@ -15,12 +16,23 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
         return  # silence stderr per-request logs
 
     def _resolve(self):
-        rel = self.path.lstrip("/")
+        rel = self.path.lstrip("/").split("?", 1)[0]
         full = os.path.join(self.directory, rel)
         if not os.path.isfile(full):
             self.send_error(404)
             return None
         return full
+
+    def _maybe_send_disposition(self):
+        # Tests opt in via ?dispo=<percent-encoded-header-value>. The value
+        # is forwarded verbatim so tests can exercise quoted, unquoted, and
+        # RFC 5987 filename* forms.
+        q = self.path.split("?", 1)
+        if len(q) != 2:
+            return
+        params = dict(p.split("=", 1) for p in q[1].split("&") if "=" in p)
+        if "dispo" in params:
+            self.send_header("Content-Disposition", unquote(params["dispo"]))
 
     def do_HEAD(self):
         path = self._resolve()
@@ -31,6 +43,7 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(size))
         self.send_header("Accept-Ranges", "bytes")
+        self._maybe_send_disposition()
         self.end_headers()
 
     def do_GET(self):
@@ -55,6 +68,7 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
             self.send_header("Accept-Ranges", "bytes")
+            self._maybe_send_disposition()
             self.end_headers()
             with open(path, "rb") as f:
                 f.seek(start)
@@ -70,6 +84,7 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(size))
             self.send_header("Accept-Ranges", "bytes")
+            self._maybe_send_disposition()
             self.end_headers()
             with open(path, "rb") as f:
                 while True:

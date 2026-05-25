@@ -1,6 +1,8 @@
 #include "DownloadDetailsWindow.h"
 
+#include <QApplication>
 #include <QFileInfo>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QProgressBar>
@@ -9,6 +11,7 @@
 #include <QTableWidgetItem>
 #include <QVBoxLayout>
 
+#include "MainWindow.h"
 #include "fdm/store/DownloadManager.h"
 
 namespace fdm_gui {
@@ -129,14 +132,21 @@ void DownloadDetailsWindow::buildUi() {
     pauseBtn_ = new QPushButton("Pause");
     resumeBtn_ = new QPushButton("Resume");
     cancelBtn_ = new QPushButton("Cancel");
+    retryBtn_ = new QPushButton("Retry");
+    redownloadBtn_ = new QPushButton("Redownload…");
     auto* btnRow = new QHBoxLayout;
     btnRow->addStretch();
+    btnRow->addWidget(retryBtn_);
+    btnRow->addWidget(redownloadBtn_);
     btnRow->addWidget(pauseBtn_);
     btnRow->addWidget(resumeBtn_);
     btnRow->addWidget(cancelBtn_);
     connect(pauseBtn_, &QPushButton::clicked, this, &DownloadDetailsWindow::onPauseClicked);
     connect(resumeBtn_, &QPushButton::clicked, this, &DownloadDetailsWindow::onResumeClicked);
     connect(cancelBtn_, &QPushButton::clicked, this, &DownloadDetailsWindow::onCancelClicked);
+    connect(retryBtn_, &QPushButton::clicked, this, &DownloadDetailsWindow::onRetryClicked);
+    connect(redownloadBtn_, &QPushButton::clicked, this,
+            &DownloadDetailsWindow::onRedownloadClicked);
 
     auto* root = new QVBoxLayout(this);
     root->addWidget(nameLabel_);
@@ -224,15 +234,42 @@ void DownloadDetailsWindow::refresh() {
     }
 
     const bool active = row.rec.status == DownloadStatus::Active;
-    const bool resumable = row.rec.status == DownloadStatus::Paused ||
-                           row.rec.status == DownloadStatus::Failed;
-    pauseBtn_->setEnabled(active);
-    resumeBtn_->setEnabled(resumable);
-    cancelBtn_->setEnabled(active || row.rec.status == DownloadStatus::Paused);
+    const bool paused = row.rec.status == DownloadStatus::Paused;
+    const bool failed = row.rec.status == DownloadStatus::Failed;
+    const bool completed = row.rec.status == DownloadStatus::Completed;
+    // Show only the actions relevant for the current state. Hidden (rather
+    // than just disabled) so the user isn't faced with a wall of greyed-out
+    // buttons.
+    pauseBtn_->setVisible(active);
+    resumeBtn_->setVisible(paused);
+    cancelBtn_->setVisible(active || paused);
+    retryBtn_->setVisible(failed);
+    redownloadBtn_->setVisible(failed || completed);
 }
 
 void DownloadDetailsWindow::onRowChanged(qint64 id) {
-    if (id == id_) refresh();
+    if (id != id_) return;
+    const auto opt = manager_->row(id_);
+    if (!opt) return;
+
+    const DownloadStatus newStatus = opt->rec.status;
+    refresh();
+
+    // Detect Active -> Completed transition. Close this window first, then
+    // signal MainWindow to surface the completion modal -- the slot is
+    // wired with Qt::QueuedConnection so it runs after this window has
+    // been hidden, not stacked over it. Opening details on an already-
+    // completed row does not re-fire the modal (lastStatusKnown_ guard).
+    const bool justCompleted = lastStatusKnown_ &&
+                               lastStatus_ != DownloadStatus::Completed &&
+                               newStatus == DownloadStatus::Completed;
+    lastStatus_ = newStatus;
+    lastStatusKnown_ = true;
+    if (justCompleted) {
+        const qint64 id = id_;
+        close();
+        emit downloadCompleted(id);
+    }
 }
 
 void DownloadDetailsWindow::onRowRemoved(qint64 id) {
@@ -241,6 +278,29 @@ void DownloadDetailsWindow::onRowRemoved(qint64 id) {
 
 void DownloadDetailsWindow::onPauseClicked() { manager_->pause(id_); }
 void DownloadDetailsWindow::onResumeClicked() { manager_->resume(id_); }
-void DownloadDetailsWindow::onCancelClicked() { manager_->cancel(id_); }
+
+void DownloadDetailsWindow::onCancelClicked() {
+    // Cancel the running download, then dismiss this window. The "Failed"
+    // state will still be visible in the main download list afterwards.
+    manager_->cancel(id_);
+    close();
+}
+
+void DownloadDetailsWindow::onRetryClicked() { manager_->retry(id_); }
+
+void DownloadDetailsWindow::onRedownloadClicked() {
+    // Walk up to the owning MainWindow and delegate -- it owns the
+    // NewDownloadDialog flow and the row-selection bookkeeping so a new
+    // download lands in the same place a user-driven "+ New" would.
+    auto* main = qobject_cast<MainWindow*>(window()->parentWidget());
+    // qobject_cast against parent fails: this window is top-level. Look up
+    // the MainWindow via the topLevelWidgets list instead.
+    if (!main) {
+        for (QWidget* w : QApplication::topLevelWidgets()) {
+            if ((main = qobject_cast<MainWindow*>(w))) break;
+        }
+    }
+    if (main) main->redownloadFromRow(id_);
+}
 
 }  // namespace fdm_gui

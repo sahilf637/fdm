@@ -28,16 +28,27 @@ public:
     // this window.
     explicit MainWindow(fdm::store::DownloadManager* manager, QWidget* parent = nullptr);
 
+public:
+    // Open the New Download dialog with the given row's URL + path pre-filled.
+    // If accepted, creates a brand-new download (separate from `id`). Public
+    // so DownloadDetailsWindow can request a redownload without duplicating
+    // the dialog/select-row glue.
+    void redownloadFromRow(qint64 id);
+
 private slots:
     void onNewDownloadClicked();
     void onPauseClicked();
     void onResumeClicked();
     void onCancelClicked();
+    void onRetryClicked();
+    void onRedownloadClicked();
     void onRemoveClicked();
     void onOpenFolderClicked();
     void onDetailsClicked();
     void onSelectionChanged();
     void onRowDoubleClicked(const QModelIndex& index);
+    void onTableContextMenu(const QPoint& pos);
+    void onDownloadCompleted(qint64 id);
 
 private:
     void buildUi();
@@ -54,6 +65,8 @@ private:
     QAction* pauseAction_ = nullptr;
     QAction* resumeAction_ = nullptr;
     QAction* cancelAction_ = nullptr;
+    QAction* retryAction_ = nullptr;
+    QAction* redownloadAction_ = nullptr;
     QAction* removeAction_ = nullptr;
     QAction* openFolderAction_ = nullptr;
     QAction* detailsAction_ = nullptr;
