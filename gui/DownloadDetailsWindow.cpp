@@ -21,6 +21,7 @@ using fdm::store::ChunkRecord;
 using fdm::store::DownloadLiveRow;
 using fdm::store::DownloadManager;
 using fdm::store::DownloadStatus;
+using fdm::store::VerificationStatus;
 
 namespace {
 
@@ -68,9 +69,10 @@ QString humanRate(double bytesPerSec) {
 
 QString statusText(DownloadStatus s) {
     switch (s) {
-        case DownloadStatus::Queued:    return "Queued";
-        case DownloadStatus::Active:    return "Downloading";
-        case DownloadStatus::Paused:    return "Paused";
+        case DownloadStatus::Queued:     return "Queued";
+        case DownloadStatus::Active:     return "Downloading";
+        case DownloadStatus::Paused:     return "Paused";
+        case DownloadStatus::Finalizing: return "Finalizing…";
         case DownloadStatus::Completed: return "Completed";
         case DownloadStatus::Failed:    return "Failed";
     }
@@ -196,10 +198,26 @@ void DownloadDetailsWindow::refresh() {
 
     QString status = "Status: " + statusText(row.rec.status);
     if (!row.rec.error.isEmpty()) status += " (" + row.rec.error + ")";
+    // Show a small verification badge when applicable. The error message
+    // for a Mismatch already lives in `error`, so we only annotate the
+    // verified case explicitly here.
+    if (row.rec.verification == VerificationStatus::Verified &&
+        !row.rec.hashAlgorithm.isEmpty()) {
+        status += QString("   ✓ %1 verified (%2)")
+                      .arg(row.rec.hashAlgorithm.toUpper(), row.rec.hashSource);
+    }
     statusLabel_->setText(status);
-    speedLabel_->setText("Speed: " + humanRate(row.bytesPerSec));
+    // Live speed only makes sense while bytes are actively moving.
+    speedLabel_->setText(row.rec.status == DownloadStatus::Active
+                             ? "Speed: " + humanRate(row.bytesPerSec)
+                             : "Speed: —");
 
-    if (row.rec.totalBytes > 0) {
+    if (row.rec.status == DownloadStatus::Finalizing) {
+        // Bytes are all on disk -- show the bar at 100% rather than an
+        // indeterminate / partial state while hashing runs.
+        overallBar_->setRange(0, 1000);
+        overallBar_->setValue(1000);
+    } else if (row.rec.totalBytes > 0) {
         const int permille = static_cast<int>(
             (row.bytesReceived * 1000) / row.rec.totalBytes);
         overallBar_->setRange(0, 1000);
@@ -222,7 +240,13 @@ void DownloadDetailsWindow::refresh() {
         chunkTable_->item(r, kColReceived)->setText(humanBytes(c.bytesReceived));
         const qint64 chunkSize = (c.endByte >= 0) ? (c.endByte - c.startByte + 1) : -1;
         if (auto* bar = qobject_cast<QProgressBar*>(chunkTable_->cellWidget(r, kColPercent))) {
-            if (chunkSize > 0) {
+            if (c.status == ChunkPersistStatus::Done) {
+                // Status is the source of truth: a Done chunk is 100% even
+                // when its endByte was never declared (single open-ended
+                // chunk for downloads with no Content-Length).
+                bar->setRange(0, 1000);
+                bar->setValue(1000);
+            } else if (chunkSize > 0) {
                 bar->setRange(0, 1000);
                 bar->setValue(static_cast<int>((c.bytesReceived * 1000) / chunkSize));
             } else {
@@ -237,12 +261,14 @@ void DownloadDetailsWindow::refresh() {
     const bool paused = row.rec.status == DownloadStatus::Paused;
     const bool failed = row.rec.status == DownloadStatus::Failed;
     const bool completed = row.rec.status == DownloadStatus::Completed;
+    const bool finalizing = row.rec.status == DownloadStatus::Finalizing;
     // Show only the actions relevant for the current state. Hidden (rather
     // than just disabled) so the user isn't faced with a wall of greyed-out
-    // buttons.
-    pauseBtn_->setVisible(active);
+    // buttons. During Finalizing nothing's actionable -- the hash check is
+    // running and there's nothing to pause / cancel mid-compute.
+    pauseBtn_->setVisible(active && !finalizing);
     resumeBtn_->setVisible(paused);
-    cancelBtn_->setVisible(active || paused);
+    cancelBtn_->setVisible((active || paused) && !finalizing);
     retryBtn_->setVisible(failed);
     redownloadBtn_->setVisible(failed || completed);
 }

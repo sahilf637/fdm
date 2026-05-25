@@ -26,6 +26,11 @@ struct Started {
     bool supportsRanges = false;
     int chunkCount = 1;
     std::vector<ChunkSpec> chunks;    // per-chunk byte ranges, indexed by ChunkSpec::index
+    // Server-advertised content hash captured during probe (Content-Digest,
+    // Digest, or Content-MD5). Empty when the server didn't provide one.
+    std::string expectedHash;         // lowercased hex
+    std::string hashAlgorithm;        // "sha256" | "sha1" | "md5"
+    std::string hashSource;           // "content-digest" | "digest" | "content-md5"
 };
 
 struct Progress {

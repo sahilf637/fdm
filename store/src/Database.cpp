@@ -25,7 +25,12 @@ CREATE TABLE IF NOT EXISTS downloads (
     status          TEXT NOT NULL,
     error           TEXT,
     created_at      INTEGER NOT NULL,
-    updated_at      INTEGER NOT NULL
+    updated_at      INTEGER NOT NULL,
+    expected_hash   TEXT,
+    hash_algorithm  TEXT,
+    hash_source     TEXT,
+    actual_hash     TEXT,
+    verification    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -70,21 +75,44 @@ void execText(QSqlDatabase& db, const QString& sql) {
 
 QString downloadStatusToString(DownloadStatus s) {
     switch (s) {
-        case DownloadStatus::Queued:    return "queued";
-        case DownloadStatus::Active:    return "active";
-        case DownloadStatus::Paused:    return "paused";
-        case DownloadStatus::Completed: return "completed";
-        case DownloadStatus::Failed:    return "failed";
+        case DownloadStatus::Queued:     return "queued";
+        case DownloadStatus::Active:     return "active";
+        case DownloadStatus::Paused:     return "paused";
+        case DownloadStatus::Finalizing: return "finalizing";
+        case DownloadStatus::Completed:  return "completed";
+        case DownloadStatus::Failed:     return "failed";
     }
     return "queued";
 }
 
 DownloadStatus downloadStatusFromString(const QString& s) {
-    if (s == "active")    return DownloadStatus::Active;
-    if (s == "paused")    return DownloadStatus::Paused;
-    if (s == "completed") return DownloadStatus::Completed;
-    if (s == "failed")    return DownloadStatus::Failed;
+    if (s == "active")     return DownloadStatus::Active;
+    if (s == "paused")     return DownloadStatus::Paused;
+    if (s == "finalizing") return DownloadStatus::Finalizing;
+    if (s == "completed")  return DownloadStatus::Completed;
+    if (s == "failed")     return DownloadStatus::Failed;
     return DownloadStatus::Queued;
+}
+
+QString verificationStatusToString(VerificationStatus s) {
+    switch (s) {
+        case VerificationStatus::None:       return "";
+        case VerificationStatus::Pending:    return "pending";
+        case VerificationStatus::Verifying:  return "verifying";
+        case VerificationStatus::Verified:   return "verified";
+        case VerificationStatus::Mismatch:   return "mismatch";
+        case VerificationStatus::Unverified: return "unverified";
+    }
+    return "";
+}
+
+VerificationStatus verificationStatusFromString(const QString& s) {
+    if (s == "pending")    return VerificationStatus::Pending;
+    if (s == "verifying")  return VerificationStatus::Verifying;
+    if (s == "verified")   return VerificationStatus::Verified;
+    if (s == "mismatch")   return VerificationStatus::Mismatch;
+    if (s == "unverified") return VerificationStatus::Unverified;
+    return VerificationStatus::None;
 }
 
 QString chunkStatusToString(ChunkPersistStatus s) {
@@ -134,6 +162,30 @@ Database::Database(const QString& dbPath) {
         if (trimmed.isEmpty()) continue;
         execText(db, trimmed);
     }
+
+    // Additive migration: SQLite has no `ADD COLUMN IF NOT EXISTS`, and the
+    // schema above only fires for fresh DBs (CREATE TABLE IF NOT EXISTS).
+    // For DBs created before these columns existed, walk the actual
+    // table_info and ADD COLUMN for each one we need.
+    QStringList existing;
+    {
+        QSqlQuery info(db);
+        if (info.exec("PRAGMA table_info(downloads)")) {
+            while (info.next()) existing.append(info.value(1).toString());
+        }
+    }
+    struct Col { const char* name; const char* ddl; };
+    const Col required[] = {
+        {"expected_hash",  "expected_hash TEXT"},
+        {"hash_algorithm", "hash_algorithm TEXT"},
+        {"hash_source",    "hash_source TEXT"},
+        {"actual_hash",    "actual_hash TEXT"},
+        {"verification",   "verification TEXT"},
+    };
+    for (const Col& c : required) {
+        if (existing.contains(c.name)) continue;
+        execText(db, QString("ALTER TABLE downloads ADD COLUMN %1").arg(c.ddl));
+    }
 }
 
 Database::~Database() {
@@ -150,8 +202,9 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     QSqlQuery q(db);
     q.prepare(
         "INSERT INTO downloads"
-        " (url, output_path, total_bytes, supports_ranges, status, error, created_at, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        " (url, output_path, total_bytes, supports_ranges, status, error, created_at, updated_at,"
+        "  expected_hash, hash_algorithm, hash_source, actual_hash, verification)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const qint64 now = nowSeconds();
     q.addBindValue(rec.url);
     q.addBindValue(rec.outputPath);
@@ -161,8 +214,54 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     q.addBindValue(rec.error.isEmpty() ? QVariant() : QVariant(rec.error));
     q.addBindValue(static_cast<qlonglong>(rec.createdAt ? rec.createdAt : now));
     q.addBindValue(static_cast<qlonglong>(now));
+    q.addBindValue(rec.expectedHash.isEmpty() ? QVariant() : QVariant(rec.expectedHash));
+    q.addBindValue(rec.hashAlgorithm.isEmpty() ? QVariant() : QVariant(rec.hashAlgorithm));
+    q.addBindValue(rec.hashSource.isEmpty() ? QVariant() : QVariant(rec.hashSource));
+    q.addBindValue(rec.actualHash.isEmpty() ? QVariant() : QVariant(rec.actualHash));
+    const QString verStr = verificationStatusToString(rec.verification);
+    q.addBindValue(verStr.isEmpty() ? QVariant() : QVariant(verStr));
     exec(q, "insertDownload");
     return q.lastInsertId().toLongLong();
+}
+
+void Database::updateExpectedHash(qint64 id, const QString& hash,
+                                  const QString& algorithm, const QString& source) {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE downloads SET expected_hash = ?, hash_algorithm = ?, hash_source = ?,"
+        " verification = COALESCE(verification, 'pending'), updated_at = ? WHERE id = ?");
+    q.addBindValue(hash.isEmpty() ? QVariant() : QVariant(hash));
+    q.addBindValue(algorithm.isEmpty() ? QVariant() : QVariant(algorithm));
+    q.addBindValue(source.isEmpty() ? QVariant() : QVariant(source));
+    q.addBindValue(static_cast<qlonglong>(nowSeconds()));
+    q.addBindValue(static_cast<qlonglong>(id));
+    exec(q, "updateExpectedHash");
+}
+
+void Database::updateVerificationResult(qint64 id, const QString& actualHash,
+                                        VerificationStatus result) {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    q.prepare(
+        "UPDATE downloads SET actual_hash = ?, verification = ?, updated_at = ? WHERE id = ?");
+    q.addBindValue(actualHash.isEmpty() ? QVariant() : QVariant(actualHash));
+    const QString verStr = verificationStatusToString(result);
+    q.addBindValue(verStr.isEmpty() ? QVariant() : QVariant(verStr));
+    q.addBindValue(static_cast<qlonglong>(nowSeconds()));
+    q.addBindValue(static_cast<qlonglong>(id));
+    exec(q, "updateVerificationResult");
+}
+
+void Database::updateVerificationStatus(qint64 id, VerificationStatus s) {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    q.prepare("UPDATE downloads SET verification = ?, updated_at = ? WHERE id = ?");
+    const QString verStr = verificationStatusToString(s);
+    q.addBindValue(verStr.isEmpty() ? QVariant() : QVariant(verStr));
+    q.addBindValue(static_cast<qlonglong>(nowSeconds()));
+    q.addBindValue(static_cast<qlonglong>(id));
+    exec(q, "updateVerificationStatus");
 }
 
 void Database::updateDownloadStatus(qint64 id, DownloadStatus s, const QString& error) {
@@ -255,44 +354,14 @@ void Database::updateChunkProgress(qint64 downloadId, const QList<ChunkRecord>& 
     }
 }
 
-QList<DownloadRecord> Database::listDownloads() const {
-    QSqlDatabase db = QSqlDatabase::database(connectionName_);
-    QSqlQuery q(db);
-    if (!q.exec(
-            "SELECT id, url, output_path, total_bytes, supports_ranges, status, error,"
-            " created_at, updated_at FROM downloads ORDER BY id ASC")) {
-        throw std::runtime_error(
-            QString("listDownloads: %1").arg(q.lastError().text()).toStdString());
-    }
-    QList<DownloadRecord> out;
-    while (q.next()) {
-        DownloadRecord r;
-        r.id = q.value(0).toLongLong();
-        r.url = q.value(1).toString();
-        r.outputPath = q.value(2).toString();
-        r.totalBytes = q.value(3).toLongLong();
-        r.supportsRanges = q.value(4).toInt() != 0;
-        r.status = downloadStatusFromString(q.value(5).toString());
-        r.error = q.value(6).toString();
-        r.createdAt = q.value(7).toLongLong();
-        r.updatedAt = q.value(8).toLongLong();
-        out.append(r);
-    }
-    return out;
-}
+namespace {
 
-std::optional<DownloadRecord> Database::getDownload(qint64 id) const {
-    QSqlDatabase db = QSqlDatabase::database(connectionName_);
-    QSqlQuery q(db);
-    q.prepare(
-        "SELECT id, url, output_path, total_bytes, supports_ranges, status, error,"
-        " created_at, updated_at FROM downloads WHERE id = ?");
-    q.addBindValue(static_cast<qlonglong>(id));
-    if (!q.exec()) {
-        throw std::runtime_error(
-            QString("getDownload: %1").arg(q.lastError().text()).toStdString());
-    }
-    if (!q.next()) return std::nullopt;
+constexpr const char* kDownloadSelectColumns =
+    "id, url, output_path, total_bytes, supports_ranges, status, error,"
+    " created_at, updated_at, expected_hash, hash_algorithm, hash_source,"
+    " actual_hash, verification";
+
+DownloadRecord readDownloadRow(const QSqlQuery& q) {
     DownloadRecord r;
     r.id = q.value(0).toLongLong();
     r.url = q.value(1).toString();
@@ -303,7 +372,40 @@ std::optional<DownloadRecord> Database::getDownload(qint64 id) const {
     r.error = q.value(6).toString();
     r.createdAt = q.value(7).toLongLong();
     r.updatedAt = q.value(8).toLongLong();
+    r.expectedHash = q.value(9).toString();
+    r.hashAlgorithm = q.value(10).toString();
+    r.hashSource = q.value(11).toString();
+    r.actualHash = q.value(12).toString();
+    r.verification = verificationStatusFromString(q.value(13).toString());
     return r;
+}
+
+}  // namespace
+
+QList<DownloadRecord> Database::listDownloads() const {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    if (!q.exec(QString("SELECT ") + kDownloadSelectColumns +
+                " FROM downloads ORDER BY id ASC")) {
+        throw std::runtime_error(
+            QString("listDownloads: %1").arg(q.lastError().text()).toStdString());
+    }
+    QList<DownloadRecord> out;
+    while (q.next()) out.append(readDownloadRow(q));
+    return out;
+}
+
+std::optional<DownloadRecord> Database::getDownload(qint64 id) const {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    q.prepare(QString("SELECT ") + kDownloadSelectColumns + " FROM downloads WHERE id = ?");
+    q.addBindValue(static_cast<qlonglong>(id));
+    if (!q.exec()) {
+        throw std::runtime_error(
+            QString("getDownload: %1").arg(q.lastError().text()).toStdString());
+    }
+    if (!q.next()) return std::nullopt;
+    return readDownloadRow(q);
 }
 
 QList<ChunkRecord> Database::chunksFor(qint64 downloadId) const {

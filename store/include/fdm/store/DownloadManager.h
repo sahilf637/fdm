@@ -61,6 +61,11 @@ public:
 
     // Insert a row in the DB and start it in the engine. Returns the new id.
     qint64 startNew(const QString& url, const QString& outputPath);
+    // Variant carrying an optional user-supplied expected hash (lowercased
+    // hex) and algorithm name. When non-empty, the hash is persisted to the
+    // row immediately and takes precedence over any server-side discovery.
+    qint64 startNew(const QString& url, const QString& outputPath,
+                    const QString& userHash, const QString& userHashAlgorithm);
 
     // Probe a URL without registering a download. Callback fires on the UI
     // thread (the same thread `this` lives on). Useful for filling in a
@@ -92,6 +97,13 @@ private:
     void persistProgressThrottled(qint64 id);
     DownloadLiveRow* find(qint64 id);
     fdm::ResumeSpec buildResumeSpec(const DownloadLiveRow& row) const;
+    // Drives a row from "bytes finished" to "verification verdict written".
+    // Discovers the hash if not already known (no-op if it is), then kicks
+    // off the QtConcurrent hashing job. Idempotent: safe to call on
+    // already-Finalizing rows during startup recovery.
+    void beginFinalize(qint64 id);
+    void startHashJob(qint64 id);
+    void onHashJobDone(qint64 id, const QString& actualHash);
 
     Database* db_;
     std::unique_ptr<fdm::DownloadEngine> engine_;

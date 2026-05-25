@@ -1,13 +1,32 @@
 #include "fdm/store/DownloadManager.h"
 
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QFile>
+#include <QFileInfo>
+#include <QFuture>
+#include <QFutureWatcher>
 #include <QMetaObject>
+#include <QPointer>
+#include <QtConcurrent>
 
 #include <utility>
 #include <variant>
 
+#include "SidecarFetcher.h"
+
 namespace fdm::store {
+
+namespace {
+
+QCryptographicHash::Algorithm qtAlgFor(const QString& alg) {
+    if (alg == "sha256") return QCryptographicHash::Sha256;
+    if (alg == "sha1")   return QCryptographicHash::Sha1;
+    return QCryptographicHash::Md5;
+}
+
+}  // namespace
+
 
 namespace {
 
@@ -78,6 +97,7 @@ DownloadManager::DownloadManager(Database* db, QObject* parent)
     // before loading the in-memory mirror so the UI sees them as Paused.
     db_->markInterruptedAsPaused();
 
+    QList<qint64> toFinalize;
     for (const DownloadRecord& rec : db_->listDownloads()) {
         DownloadLiveRow row;
         row.rec = rec;
@@ -85,9 +105,22 @@ DownloadManager::DownloadManager(Database* db, QObject* parent)
         row.bytesReceived = sumChunkBytes(row.chunks);
         rows_.insert(rec.id, row);
         rowOrder_.append(rec.id);
+        if (rec.status == DownloadStatus::Finalizing) {
+            toFinalize.append(rec.id);
+        }
     }
 
     engine_ = std::make_unique<fdm::DownloadEngine>();
+
+    // Pick up any downloads that crashed mid-verification: file bytes are
+    // on disk, just re-run hash discovery + compute. Defer to the event
+    // loop so this happens after the constructor's caller has finished
+    // (avoids re-entrancy through signal connections that haven't been
+    // wired yet by the caller).
+    for (qint64 id : toFinalize) {
+        QMetaObject::invokeMethod(
+            this, [this, id]() { beginFinalize(id); }, Qt::QueuedConnection);
+    }
 }
 
 DownloadManager::~DownloadManager() = default;
@@ -119,6 +152,11 @@ DownloadLiveRow* DownloadManager::find(qint64 id) {
 }
 
 qint64 DownloadManager::startNew(const QString& url, const QString& outputPath) {
+    return startNew(url, outputPath, QString(), QString());
+}
+
+qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
+                                 const QString& userHash, const QString& userHashAlgorithm) {
     DownloadRecord rec;
     rec.url = url;
     rec.outputPath = outputPath;
@@ -126,6 +164,12 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath) 
     rec.supportsRanges = false;
     rec.status = DownloadStatus::Active;
     rec.createdAt = QDateTime::currentSecsSinceEpoch();
+    if (!userHash.isEmpty() && !userHashAlgorithm.isEmpty()) {
+        rec.expectedHash = userHash;
+        rec.hashAlgorithm = userHashAlgorithm;
+        rec.hashSource = "user";
+        rec.verification = VerificationStatus::Pending;
+    }
     const qint64 id = db_->insertDownload(rec);
 
     DownloadLiveRow row;
@@ -333,6 +377,20 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 db_->updateDownloadTotals(id, e.contentLength, e.supportsRanges);
                 db_->replaceChunks(id, row->chunks);
                 lastPersistMs_[id] = QDateTime::currentMSecsSinceEpoch();
+                // If the server volunteered a digest AND the user didn't
+                // already supply one at startNew time, persist it. User
+                // hashes always win over server-side discovery.
+                if (row->rec.hashSource != "user" && !e.expectedHash.empty()) {
+                    row->rec.expectedHash = QString::fromStdString(e.expectedHash);
+                    row->rec.hashAlgorithm = QString::fromStdString(e.hashAlgorithm);
+                    row->rec.hashSource = QString::fromStdString(e.hashSource);
+                    if (row->rec.verification == VerificationStatus::None) {
+                        row->rec.verification = VerificationStatus::Pending;
+                    }
+                    db_->updateExpectedHash(id, row->rec.expectedHash,
+                                            row->rec.hashAlgorithm,
+                                            row->rec.hashSource);
+                }
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Progress>) {
                 row->chunks = chunksFromProgress(e.chunks);
@@ -357,16 +415,28 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Finished>) {
                 row->engineId = 0;
-                row->rec.status = DownloadStatus::Completed;
                 row->bytesPerSec = 0;
                 if (row->rec.totalBytes > 0) {
                     row->bytesReceived = row->rec.totalBytes;
+                } else if (row->bytesReceived > 0) {
+                    // Server never told us Content-Length up front (chunked
+                    // transfer-encoding, or just a 200 without the header).
+                    // We know the true size now: it's what we actually read.
+                    // Backfill totalBytes so the row's Size column and the
+                    // progress bar read correctly from here on.
+                    row->rec.totalBytes = row->bytesReceived;
+                    db_->updateDownloadTotals(id, row->bytesReceived,
+                                              row->rec.supportsRanges);
                 }
-                db_->updateDownloadStatus(id, DownloadStatus::Completed);
+                // Persist final chunk state, then transition to Finalizing.
+                // The actual Completed transition happens after hash check.
                 if (!row->chunks.isEmpty()) {
                     db_->updateChunkProgress(id, row->chunks);
                 }
+                row->rec.status = DownloadStatus::Finalizing;
+                db_->updateDownloadStatus(id, DownloadStatus::Finalizing);
                 emit rowChanged(id);
+                beginFinalize(id);
             } else if constexpr (std::is_same_v<T, fdm::Failed>) {
                 row->engineId = 0;
                 row->rec.status = DownloadStatus::Failed;
@@ -380,6 +450,117 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
             }
         },
         ev);
+}
+
+void DownloadManager::beginFinalize(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+
+    // Three branches based on what we already know:
+    //   (a) hash known (user input or HTTP headers) -> hash + compare
+    //   (b) no hash known yet -> try sidecar, then either (a) or (c)
+    //   (c) sidecar also empty -> mark Unverified and finish without compare
+    if (!row->rec.expectedHash.isEmpty()) {
+        startHashJob(id);
+        return;
+    }
+
+    // Probe headers had nothing; try sidecar files. Use the saved file's
+    // basename when looking up manifest-style sidecars so multi-entry
+    // checksum files resolve to OUR line.
+    auto* fetcher = new SidecarFetcher(this);
+    const QString baseUrl = row->rec.url;  // post-redirect URL not retained on row; use original
+    const QString filename = QFileInfo(row->rec.outputPath).fileName();
+    QPointer<DownloadManager> guard = this;
+    connect(fetcher, &SidecarFetcher::result, this,
+            [this, id, fetcher, guard](QString hash, QString algorithm, QString source) {
+                fetcher->deleteLater();
+                if (!guard) return;
+                DownloadLiveRow* r = find(id);
+                if (!r) return;
+                if (!hash.isEmpty()) {
+                    r->rec.expectedHash = hash;
+                    r->rec.hashAlgorithm = algorithm;
+                    r->rec.hashSource = source;
+                    if (r->rec.verification == VerificationStatus::None) {
+                        r->rec.verification = VerificationStatus::Pending;
+                    }
+                    db_->updateExpectedHash(id, hash, algorithm, source);
+                    emit rowChanged(id);
+                    startHashJob(id);
+                } else {
+                    // No hash anywhere -- complete without verification.
+                    r->rec.status = DownloadStatus::Completed;
+                    r->rec.verification = VerificationStatus::Unverified;
+                    db_->updateDownloadStatus(id, DownloadStatus::Completed);
+                    db_->updateVerificationStatus(id, VerificationStatus::Unverified);
+                    emit rowChanged(id);
+                }
+            });
+    fetcher->fetch(baseUrl, filename);
+}
+
+void DownloadManager::startHashJob(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+
+    row->rec.verification = VerificationStatus::Verifying;
+    db_->updateVerificationStatus(id, VerificationStatus::Verifying);
+    emit rowChanged(id);
+
+    const QString path = row->rec.outputPath;
+    const QString algName = row->rec.hashAlgorithm;
+    const QCryptographicHash::Algorithm alg = qtAlgFor(algName);
+
+    // QtConcurrent::run dispatches onto the global thread pool. The worker
+    // returns a hex digest (or empty on read failure); we observe via a
+    // QFutureWatcher whose finished() fires back on the manager's thread.
+    auto* watcher = new QFutureWatcher<QString>(this);
+    QFuture<QString> future = QtConcurrent::run([path, alg]() -> QString {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) return {};
+        QCryptographicHash h(alg);
+        if (!h.addData(&f)) return {};
+        return QString::fromLatin1(h.result().toHex());
+    });
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, id, watcher]() {
+                const QString actual = watcher->result();
+                watcher->deleteLater();
+                onHashJobDone(id, actual);
+            });
+    watcher->setFuture(future);
+}
+
+void DownloadManager::onHashJobDone(qint64 id, const QString& actualHash) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+
+    row->rec.actualHash = actualHash;
+    const QString expected = row->rec.expectedHash.toLower();
+    const QString actualLower = actualHash.toLower();
+
+    if (actualHash.isEmpty()) {
+        // Hash compute failed (file gone, IO error). Treat as a mismatch
+        // so the user sees something went wrong rather than silently
+        // accepting an unverified file we claimed we'd verify.
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.verification = VerificationStatus::Mismatch;
+        row->rec.error = "Could not read file for hash verification";
+    } else if (actualLower == expected) {
+        row->rec.status = DownloadStatus::Completed;
+        row->rec.verification = VerificationStatus::Verified;
+    } else {
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.verification = VerificationStatus::Mismatch;
+        row->rec.error =
+            QString("Hash mismatch (%1): expected %2, got %3")
+                .arg(row->rec.hashAlgorithm, expected, actualLower);
+    }
+
+    db_->updateVerificationResult(id, actualHash, row->rec.verification);
+    db_->updateDownloadStatus(id, row->rec.status, row->rec.error);
+    emit rowChanged(id);
 }
 
 void DownloadManager::persistProgressThrottled(qint64 id) {

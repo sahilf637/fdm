@@ -13,7 +13,7 @@ endif()
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 find_package(CURL REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets Sql)
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Sql Network Concurrent)
 
 enable_testing()
 

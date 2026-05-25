@@ -12,14 +12,30 @@ namespace fdm::store {
 // readability when poking the SQLite file with the `sqlite3` CLI; the
 // runtime overhead is irrelevant for a tool that updates rows at <= 10 Hz.
 enum class DownloadStatus {
-    Queued,     // user added it but the engine hasn't started running it yet
-    Active,     // engine is downloading bytes right now
-    Paused,     // user paused, or app shut down while Active
+    Queued,      // user added it but the engine hasn't started running it yet
+    Active,      // engine is downloading bytes right now
+    Paused,      // user paused, or app shut down while Active
+    Finalizing,  // bytes on disk, hash discovery + verification running
     Completed,
     Failed,
 };
 
 enum class ChunkPersistStatus { Active, Done, Failed };
+
+// Lifecycle of the optional hash check. `Pending` means we know we WILL try
+// to verify (a hash has been recorded); `Unverified` means we tried and
+// concluded there's no hash available -- not a failure.
+enum class VerificationStatus {
+    None,        // no verification attempted yet (default for fresh rows)
+    Pending,
+    Verifying,
+    Verified,
+    Mismatch,
+    Unverified,  // no hash discoverable from any source
+};
+
+QString verificationStatusToString(VerificationStatus s);
+VerificationStatus verificationStatusFromString(const QString& s);
 
 QString downloadStatusToString(DownloadStatus s);
 DownloadStatus downloadStatusFromString(const QString& s);
@@ -36,6 +52,14 @@ struct DownloadRecord {
     QString error;
     qint64 createdAt = 0;      // unix seconds
     qint64 updatedAt = 0;
+    // Hash verification fields. expectedHash / hashAlgorithm / hashSource
+    // identify the digest we'll compare against; actualHash is filled
+    // post-verification. All empty when no hash is known.
+    QString expectedHash;
+    QString hashAlgorithm;     // "sha256" | "sha1" | "md5"
+    QString hashSource;        // "user" | "content-digest" | "digest" | "content-md5" | "sidecar-*"
+    QString actualHash;
+    VerificationStatus verification = VerificationStatus::None;
 };
 
 struct ChunkRecord {
@@ -87,6 +111,20 @@ public:
     QList<DownloadRecord> listDownloads() const;
     std::optional<DownloadRecord> getDownload(qint64 id) const;
     QList<ChunkRecord> chunksFor(qint64 downloadId) const;
+
+    // Persist the expected hash + its source after it's been discovered
+    // (from user input, headers, or sidecar). Also bumps verification to
+    // Pending if it was None.
+    void updateExpectedHash(qint64 id, const QString& hash,
+                            const QString& algorithm, const QString& source);
+
+    // Persist the actual hash + final verification verdict after the local
+    // hash compute finishes.
+    void updateVerificationResult(qint64 id, const QString& actualHash,
+                                  VerificationStatus result);
+
+    // Set the verification column without other changes.
+    void updateVerificationStatus(qint64 id, VerificationStatus s);
 
     // On app startup: any download persisted as Active was interrupted by
     // the previous process exit. Demote to Paused so the user can resume.

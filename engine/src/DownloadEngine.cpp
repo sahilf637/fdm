@@ -91,6 +91,11 @@ struct HeaderState {
     std::int64_t contentRangeTotal = -1;   // populated from "Content-Range: bytes A-B/TOTAL" (206 path)
     bool acceptRanges = false;             // populated from "Accept-Ranges: bytes"
     std::string suggestedFilename;         // populated from Content-Disposition
+    // Best digest captured so far. Subsequent stronger algorithms overwrite
+    // weaker ones; weaker never overwrite stronger.
+    std::string expectedHash;
+    std::string hashAlgorithm;
+    std::string hashSource;
 };
 
 // Strip path separators and control characters: a server cannot be trusted
@@ -198,6 +203,140 @@ std::string extractDispositionFilename(const char* p, const char* end) {
     return sanitizeFilename(std::move(raw));
 }
 
+// Strength order for digest selection. Higher = stronger.
+int hashStrength(const std::string& alg) {
+    if (alg == "sha256") return 3;
+    if (alg == "sha1") return 2;
+    if (alg == "md5") return 1;
+    return 0;
+}
+
+// RFC 4648 base64 decode (no whitespace tolerance -- header values are
+// expected to be clean tokens). Returns "" on malformed input.
+std::string base64Decode(const std::string& s) {
+    static const int kInvalid = -1;
+    static int table[256];
+    static bool init = false;
+    if (!init) {
+        for (int i = 0; i < 256; ++i) table[i] = kInvalid;
+        const char* alpha =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) table[static_cast<unsigned char>(alpha[i])] = i;
+        // base64url variants -- some senders use them.
+        table[static_cast<unsigned char>('-')] = 62;
+        table[static_cast<unsigned char>('_')] = 63;
+        init = true;
+    }
+
+    std::string out;
+    int buf = 0;
+    int bits = 0;
+    for (char c : s) {
+        if (c == '=' || c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        const int v = table[static_cast<unsigned char>(c)];
+        if (v == kInvalid) return {};
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += static_cast<char>((buf >> bits) & 0xFF);
+        }
+    }
+    return out;
+}
+
+std::string toHexLower(const std::string& bytes) {
+    static const char* d = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (unsigned char c : bytes) {
+        out += d[c >> 4];
+        out += d[c & 0xF];
+    }
+    return out;
+}
+
+bool isHexString(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Normalize an algorithm name. RFC 3230 used "MD5" / "SHA" / "SHA-256";
+// RFC 9530 standardizes lowercase "sha-256" / "sha-1" / "md5"; in the wild
+// you see all of these. Return canonical: "sha256" | "sha1" | "md5" | "".
+std::string canonicalAlgorithm(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // Strip whitespace and dashes.
+    std::string out;
+    for (char c : s) if (c != '-' && c != ' ') out += c;
+    if (out == "sha256") return "sha256";
+    if (out == "sha1" || out == "sha") return "sha1";
+    if (out == "md5") return "md5";
+    return {};
+}
+
+std::size_t hexLengthFor(const std::string& alg) {
+    if (alg == "sha256") return 64;
+    if (alg == "sha1") return 40;
+    if (alg == "md5") return 32;
+    return 0;
+}
+
+// Decode a digest token's value into hex according to its encoding. Value
+// is base64 in both RFC 3230 and 9530. Returns "" on malformed input or
+// length mismatch with the declared algorithm.
+std::string decodeDigestValue(const std::string& alg, const std::string& base64) {
+    const std::string raw = base64Decode(base64);
+    if (raw.empty()) return {};
+    const std::size_t expected = hexLengthFor(alg) / 2;
+    if (raw.size() != expected) return {};
+    return toHexLower(raw);
+}
+
+// Updates st to use (alg, hexValue) iff `alg` is stronger than what's
+// already stored. Empty hexValue is treated as "no update".
+void considerDigest(HeaderState* st, const std::string& alg,
+                    const std::string& hexValue, const std::string& source) {
+    if (alg.empty() || hexValue.empty()) return;
+    if (hashStrength(alg) <= hashStrength(st->hashAlgorithm)) return;
+    st->expectedHash = hexValue;
+    st->hashAlgorithm = alg;
+    st->hashSource = source;
+}
+
+// Parse RFC 9530 "Content-Digest" value:
+//   sha-256=:<base64>:, md5=:<base64>:
+// Or RFC 3230 "Digest" value:
+//   sha-256=<base64>, md5=<base64>
+// Same comma-separated key=value structure; RFC 9530 wraps the value in
+// colons (sf-binary). We strip the colons if present.
+void parseDigestList(HeaderState* st, const char* p, const char* end,
+                     const std::string& source) {
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ',')) ++p;
+        const char* algStart = p;
+        while (p < end && *p != '=' && *p != ',') ++p;
+        if (p >= end || *p != '=') break;
+        std::string alg = canonicalAlgorithm(std::string(algStart, p - algStart));
+        ++p;  // consume '='
+        // Optional leading ':' (RFC 9530 sf-binary).
+        if (p < end && *p == ':') ++p;
+        const char* valStart = p;
+        while (p < end && *p != ',' && *p != ':' && *p != ' ' && *p != '\t') ++p;
+        std::string b64(valStart, p - valStart);
+        // Optional trailing ':'.
+        if (p < end && *p == ':') ++p;
+        // Skip RFC 3230 quality qualifier (e.g. ";q=0.5") if present.
+        while (p < end && *p != ',') ++p;
+        considerDigest(st, alg, decodeDigestValue(alg, b64), source);
+    }
+}
+
 bool startsWithCI(const char* s, std::size_t slen, const char* prefix) {
     const std::size_t plen = std::strlen(prefix);
     if (slen < plen) return false;
@@ -234,6 +373,19 @@ std::size_t headerCallback(char* buf, std::size_t size, std::size_t nmemb, void*
         const char* p = skipValueWhitespace(buf + std::strlen("content-disposition:"), buf + len);
         std::string fn = extractDispositionFilename(p, buf + len);
         if (!fn.empty()) st->suggestedFilename = std::move(fn);
+    } else if (startsWithCI(buf, len, "content-digest:")) {
+        const char* p = skipValueWhitespace(buf + std::strlen("content-digest:"), buf + len);
+        parseDigestList(st, p, buf + len, "content-digest");
+    } else if (startsWithCI(buf, len, "digest:")) {
+        const char* p = skipValueWhitespace(buf + std::strlen("digest:"), buf + len);
+        parseDigestList(st, p, buf + len, "digest");
+    } else if (startsWithCI(buf, len, "content-md5:")) {
+        // Legacy: value is base64 of raw MD5 bytes, no algorithm prefix.
+        const char* p = skipValueWhitespace(buf + std::strlen("content-md5:"), buf + len);
+        std::string b64(p, buf + len - p);
+        // Trim trailing whitespace.
+        while (!b64.empty() && (b64.back() == ' ' || b64.back() == '\t')) b64.pop_back();
+        considerDigest(st, "md5", decodeDigestValue("md5", b64), "content-md5");
     } else if (startsWithCI(buf, len, "content-range:")) {
         // Format: "Content-Range: bytes 0-0/12345" or ".../*"
         const char* p = skipValueWhitespace(buf + std::strlen("content-range:"), buf + len);
@@ -287,6 +439,9 @@ struct DownloadEngine::DownloadState {
     std::function<void(EngineEvent)> onEvent;
     std::int64_t totalBytes = -1;
     bool supportsRanges = false;
+    std::string expectedHash;
+    std::string hashAlgorithm;
+    std::string hashSource;
     int totalChunks = 0;
     int completedChunks = 0;
     int failedChunks = 0;
@@ -444,6 +599,9 @@ void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onR
             result.info.supportsRanges = supportsRanges;
             result.info.contentLength = length;
             result.info.suggestedFilename = state->header.suggestedFilename;
+            result.info.expectedHash = state->header.expectedHash;
+            result.info.hashAlgorithm = state->header.hashAlgorithm;
+            result.info.hashSource = state->header.hashSource;
             char* eff = nullptr;
             curl_easy_getinfo(state->easy, CURLINFO_EFFECTIVE_URL, &eff);
             if (eff) result.info.finalUrl = eff;
@@ -501,7 +659,14 @@ void DownloadEngine::launchTasks(DownloadState* state,
     if (chunks.empty()) {
         // Nothing to do (content-length 0). Emit a tidy Started + Finished
         // pair so callers can tear down without special-casing.
-        state->emit(Started{state->totalBytes, state->supportsRanges, 0, {}});
+        Started zero;
+        zero.contentLength = state->totalBytes;
+        zero.supportsRanges = state->supportsRanges;
+        zero.chunkCount = 0;
+        zero.expectedHash = state->expectedHash;
+        zero.hashAlgorithm = state->hashAlgorithm;
+        zero.hashSource = state->hashSource;
+        state->emit(std::move(zero));
         state->emit(Finished{});
         delete state;
         return;
@@ -524,8 +689,15 @@ void DownloadEngine::launchTasks(DownloadState* state,
         state->completedChunks = alreadyDone;
     }
 
-    state->emit(Started{state->totalBytes, state->supportsRanges,
-                        state->totalChunks, chunks});
+    Started started;
+    started.contentLength = state->totalBytes;
+    started.supportsRanges = state->supportsRanges;
+    started.chunkCount = state->totalChunks;
+    started.chunks = chunks;
+    started.expectedHash = state->expectedHash;
+    started.hashAlgorithm = state->hashAlgorithm;
+    started.hashSource = state->hashSource;
+    state->emit(std::move(started));
 
     try {
         for (const auto& spec : chunks) {
@@ -637,6 +809,9 @@ DownloadId DownloadEngine::start(std::string url,
 
         state->totalBytes = pr.info.contentLength;
         state->supportsRanges = pr.info.supportsRanges;
+        state->expectedHash = pr.info.expectedHash;
+        state->hashAlgorithm = pr.info.hashAlgorithm;
+        state->hashSource = pr.info.hashSource;
 
         std::string err;
         if (!preallocateFile(state->outputPath, pr.info.contentLength, &err)) {

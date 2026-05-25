@@ -29,11 +29,12 @@ QString humanRate(double bytesPerSec) {
 
 QString statusLabel(DownloadStatus s) {
     switch (s) {
-        case DownloadStatus::Queued:    return "Queued";
-        case DownloadStatus::Active:    return "Downloading";
-        case DownloadStatus::Paused:    return "Paused";
-        case DownloadStatus::Completed: return "Completed";
-        case DownloadStatus::Failed:    return "Failed";
+        case DownloadStatus::Queued:     return "Queued";
+        case DownloadStatus::Active:     return "Downloading";
+        case DownloadStatus::Paused:     return "Paused";
+        case DownloadStatus::Finalizing: return "Finalizing…";
+        case DownloadStatus::Completed:  return "Completed";
+        case DownloadStatus::Failed:     return "Failed";
     }
     return "?";
 }
@@ -93,6 +94,13 @@ QVariant DownloadListModel::data(const QModelIndex& index, int role) const {
             return name.isEmpty() ? row.rec.outputPath : name;
         }
         case ColSize:
+            // No Content-Length up front -> fall back to the running count
+            // so the user sees the file growing rather than a static "—".
+            // On completion the manager backfills totalBytes from bytes
+            // received, so this branch only runs while we're still streaming.
+            if (row.rec.totalBytes < 0 && row.bytesReceived > 0) {
+                return humanBytes(row.bytesReceived);
+            }
             return humanBytes(row.rec.totalBytes);
         case ColProgress:
             return progressLabel(row);

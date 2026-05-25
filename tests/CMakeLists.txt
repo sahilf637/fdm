@@ -8,6 +8,7 @@ add_executable(fdm_tests
   test_engine_fallback.cpp
   test_engine_robustness.cpp
   test_engine_disposition.cpp
+  test_engine_digest.cpp
   test_paths.cpp
 )
 target_include_directories(fdm_tests PRIVATE

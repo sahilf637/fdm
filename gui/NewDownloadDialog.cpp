@@ -40,6 +40,24 @@ QString extensionOf(const QString& filename) {
     return filename.mid(dot);
 }
 
+bool isHexOnly(const QString& s) {
+    for (QChar c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return !s.isEmpty();
+}
+
+// Returns canonical algorithm name for a trimmed hex hash, or "" if the
+// length doesn't match any supported algorithm.
+QString algorithmForHashLength(int len) {
+    if (len == 64) return "sha256";
+    if (len == 40) return "sha1";
+    if (len == 32) return "md5";
+    return {};
+}
+
 // Merge what we know into a final leaf filename. Precedence:
 //   1. User-typed name with its own extension -- respect verbatim.
 //   2. User-typed name without an extension -- append the best extension we
@@ -92,10 +110,15 @@ void NewDownloadDialog::buildUi() {
     nameEdit_ = new QLineEdit;
     nameEdit_->setPlaceholderText("filename (server-detected if blank)");
 
+    hashEdit_ = new QLineEdit;
+    hashEdit_->setPlaceholderText(
+        "SHA-256 / SHA-1 / MD5 hex — algorithm auto-detected from length");
+
     auto* form = new QFormLayout;
     form->addRow("URL:", urlEdit_);
     form->addRow("Save to:", dirRow);
     form->addRow("Save as:", nameEdit_);
+    form->addRow("Hash (optional):", hashEdit_);
 
     statusLabel_ = new QLabel;
     statusLabel_->setStyleSheet("color: palette(mid);");
@@ -179,6 +202,23 @@ void NewDownloadDialog::onAccept() {
         return;
     }
 
+    // Validate optional hash. If non-empty: must be hex and 64/40/32 chars.
+    const QString rawHash = hashEdit_->text().trimmed();
+    if (!rawHash.isEmpty()) {
+        const QString alg = algorithmForHashLength(rawHash.size());
+        if (alg.isEmpty() || !isHexOnly(rawHash)) {
+            QMessageBox::warning(this, "Invalid hash",
+                                 "Expected hex SHA-256 (64), SHA-1 (40), or MD5 (32). "
+                                 "Leave blank to skip.");
+            return;
+        }
+        userHash_ = rawHash.toLower();
+        userHashAlgorithm_ = alg;
+    } else {
+        userHash_.clear();
+        userHashAlgorithm_.clear();
+    }
+
     setFormEnabled(false);
     statusLabel_->setText("Detecting filename…");
     statusLabel_->setVisible(true);
@@ -195,10 +235,11 @@ void NewDownloadDialog::onAccept() {
 }
 
 void NewDownloadDialog::prefill(const QString& url, const QString& directory,
-                                const QString& filename) {
+                                const QString& filename, const QString& expectedHash) {
     if (!url.isEmpty()) urlEdit_->setText(url);
     if (!directory.isEmpty()) dirEdit_->setText(directory);
     if (!filename.isEmpty()) nameEdit_->setText(filename);
+    if (!expectedHash.isEmpty()) hashEdit_->setText(expectedHash);
 }
 
 QString NewDownloadDialog::url() const { return urlEdit_->text().trimmed(); }

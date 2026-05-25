@@ -31,11 +31,18 @@ public:
     // Optional pre-fill (e.g., when the user clicks "Redownload" on an
     // existing row). Empty strings leave that field at its default.
     void prefill(const QString& url, const QString& directory,
-                 const QString& filename);
+                 const QString& filename, const QString& expectedHash = QString());
 
     // Valid only after exec() returned QDialog::Accepted.
     QString url() const;
     QString outputPath() const;
+    // The hash the user pasted into the optional field, trimmed and
+    // lowercased. Empty if they didn't enter one (or entered something
+    // that didn't validate).
+    QString userHash() const { return userHash_; }
+    // Algorithm inferred from the hash's length: "sha256" (64), "sha1"
+    // (40), "md5" (32). Empty when no user hash.
+    QString userHashAlgorithm() const { return userHashAlgorithm_; }
 
 private slots:
     void onBrowseClicked();
@@ -52,12 +59,15 @@ private:
     QLineEdit* urlEdit_ = nullptr;
     QLineEdit* dirEdit_ = nullptr;
     QLineEdit* nameEdit_ = nullptr;
+    QLineEdit* hashEdit_ = nullptr;
     QPushButton* browseBtn_ = nullptr;
     QPushButton* startBtn_ = nullptr;
     QPushButton* cancelBtn_ = nullptr;
     QLabel* statusLabel_ = nullptr;
 
     QString resolvedPath_;
+    QString userHash_;
+    QString userHashAlgorithm_;
 };
 
 }  // namespace fdm_gui

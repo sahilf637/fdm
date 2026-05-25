@@ -195,7 +195,8 @@ void MainWindow::onNewDownloadClicked() {
     const QString path = dlg.outputPath();
     if (url.isEmpty() || path.isEmpty()) return;
 
-    const qint64 id = manager_->startNew(url, path);
+    const qint64 id =
+        manager_->startNew(url, path, dlg.userHash(), dlg.userHashAlgorithm());
     statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()),
                              4000);
     // Select the new row so action states update without an extra click.
@@ -236,13 +237,16 @@ void MainWindow::redownloadFromRow(qint64 id) {
     const QFileInfo fi(row->rec.outputPath);
 
     NewDownloadDialog dlg(manager_, this);
-    dlg.prefill(row->rec.url, fi.absolutePath(), fi.fileName());
+    // Carry the previously known hash forward so a re-download starts with
+    // the same verification expectations.
+    dlg.prefill(row->rec.url, fi.absolutePath(), fi.fileName(), row->rec.expectedHash);
     if (dlg.exec() != QDialog::Accepted) return;
     const QString url = dlg.url();
     const QString path = dlg.outputPath();
     if (url.isEmpty() || path.isEmpty()) return;
 
-    const qint64 newId = manager_->startNew(url, path);
+    const qint64 newId =
+        manager_->startNew(url, path, dlg.userHash(), dlg.userHashAlgorithm());
     statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()), 4000);
     const int newRow = model_->rowCount() - 1;
     if (newRow >= 0 && model_->idForRow(newRow) == newId) {
