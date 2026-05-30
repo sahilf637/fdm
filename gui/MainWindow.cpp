@@ -8,6 +8,8 @@
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QIcon>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeySequence>
 #include <QMenu>
 #include <QMenuBar>
@@ -252,6 +254,68 @@ void MainWindow::redownloadFromRow(qint64 id) {
     if (newRow >= 0 && model_->idForRow(newRow) == newId) {
         table_->selectRow(newRow);
     }
+}
+
+void MainWindow::openExternalDownload(const ExternalDownloadRequest& req) {
+    // Bring the app to the foreground regardless of whether we end up starting
+    // a download -- the user just clicked something in their browser.
+    showNormal();
+    raise();
+    activateWindow();
+
+    if (req.url.isEmpty()) return;
+    const QUrl u(req.url);
+    if (u.scheme() != "http" && u.scheme() != "https") return;
+
+    NewDownloadDialog dlg(manager_, this);
+    dlg.prefill(req.url, req.dir, req.filename, req.hash);
+    // The probe the dialog runs on accept needs the same auth context, or an
+    // authenticated URL would 401 at filename-detection time.
+    dlg.setRequestHeaders(req.headers);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString url = dlg.url();
+    const QString path = dlg.outputPath();
+    if (url.isEmpty() || path.isEmpty()) return;
+
+    const qint64 id = manager_->startNew(url, path, dlg.userHash(),
+                                         dlg.userHashAlgorithm(), req.headers);
+    statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()),
+                             4000);
+    const int row = model_->rowCount() - 1;
+    if (row >= 0 && model_->idForRow(row) == id) {
+        table_->selectRow(row);
+    }
+}
+
+void MainWindow::handleIpcMessage(const QByteArray& payload) {
+    if (payload.trimmed().isEmpty()) {
+        // Plain "raise" ping from a re-launched instance.
+        showNormal();
+        raise();
+        activateWindow();
+        return;
+    }
+
+    QJsonParseError err{};
+    const QJsonDocument doc = QJsonDocument::fromJson(payload, &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+        showNormal();
+        raise();
+        activateWindow();
+        return;
+    }
+
+    const QJsonObject o = doc.object();
+    ExternalDownloadRequest req;
+    req.url = o.value("url").toString();
+    req.filename = o.value("filename").toString();
+    req.dir = o.value("dir").toString();
+    req.hash = o.value("hash").toString();
+    const QJsonObject headers = o.value("headers").toObject();
+    for (auto it = headers.begin(); it != headers.end(); ++it) {
+        req.headers.append({it.key(), it.value().toString()});
+    }
+    openExternalDownload(req);
 }
 
 void MainWindow::onRemoveClicked() {

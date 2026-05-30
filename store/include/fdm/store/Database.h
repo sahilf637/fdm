@@ -60,6 +60,10 @@ struct DownloadRecord {
     QString hashSource;        // "user" | "content-digest" | "digest" | "content-md5" | "sidecar-*"
     QString actualHash;
     VerificationStatus verification = VerificationStatus::None;
+    // Extra request headers to replay on resume, stored as a JSON array of
+    // raw "Name: value" lines (e.g. cookies/referer forwarded from a browser).
+    // Empty for downloads started by typing a URL into the dialog.
+    QString requestHeaders;
 };
 
 struct ChunkRecord {

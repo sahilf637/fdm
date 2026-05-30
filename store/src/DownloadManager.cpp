@@ -6,6 +6,8 @@
 #include <QFileInfo>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QMetaObject>
 #include <QPointer>
 #include <QtConcurrent>
@@ -88,6 +90,42 @@ qint64 sumChunkBytes(const QList<ChunkRecord>& chunks) {
     return sum;
 }
 
+// Header plumbing. The engine speaks raw "Name: value" lines; the DB stores
+// them as a JSON array of those same lines (one round-trippable representation
+// shared by both directions).
+std::vector<std::string> toEngineHeaders(const QList<QPair<QString, QString>>& headers) {
+    std::vector<std::string> out;
+    out.reserve(static_cast<std::size_t>(headers.size()));
+    for (const auto& [name, value] : headers) {
+        if (name.isEmpty()) continue;
+        out.push_back((name + ": " + value).toStdString());
+    }
+    return out;
+}
+
+QString headersToJson(const QList<QPair<QString, QString>>& headers) {
+    if (headers.isEmpty()) return {};
+    QJsonArray arr;
+    for (const auto& [name, value] : headers) {
+        if (name.isEmpty()) continue;
+        arr.append(name + ": " + value);
+    }
+    if (arr.isEmpty()) return {};
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+std::vector<std::string> headersFromJson(const QString& json) {
+    std::vector<std::string> out;
+    if (json.isEmpty()) return out;
+    const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+    if (!doc.isArray()) return out;
+    for (const QJsonValue& v : doc.array()) {
+        const QString line = v.toString();
+        if (!line.isEmpty()) out.push_back(line.toStdString());
+    }
+    return out;
+}
+
 }  // namespace
 
 DownloadManager::DownloadManager(Database* db, QObject* parent)
@@ -152,11 +190,17 @@ DownloadLiveRow* DownloadManager::find(qint64 id) {
 }
 
 qint64 DownloadManager::startNew(const QString& url, const QString& outputPath) {
-    return startNew(url, outputPath, QString(), QString());
+    return startNew(url, outputPath, QString(), QString(), {});
 }
 
 qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
                                  const QString& userHash, const QString& userHashAlgorithm) {
+    return startNew(url, outputPath, userHash, userHashAlgorithm, {});
+}
+
+qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
+                                 const QString& userHash, const QString& userHashAlgorithm,
+                                 const QList<QPair<QString, QString>>& headers) {
     DownloadRecord rec;
     rec.url = url;
     rec.outputPath = outputPath;
@@ -164,6 +208,7 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
     rec.supportsRanges = false;
     rec.status = DownloadStatus::Active;
     rec.createdAt = QDateTime::currentSecsSinceEpoch();
+    rec.requestHeaders = headersToJson(headers);
     if (!userHash.isEmpty() && !userHashAlgorithm.isEmpty()) {
         rec.expectedHash = userHash;
         rec.hashAlgorithm = userHashAlgorithm;
@@ -181,7 +226,7 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
 
     DownloadLiveRow* live = find(id);
     live->engineId = engine_->start(
-        url.toStdString(), outputPath.toStdString(),
+        url.toStdString(), outputPath.toStdString(), toEngineHeaders(headers),
         [this, id](fdm::EngineEvent ev) {
             QMetaObject::invokeMethod(
                 this, [this, id, ev = std::move(ev)]() mutable {
@@ -194,8 +239,14 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
 
 void DownloadManager::probe(const QString& url,
                             std::function<void(ProbeResult)> onResult) {
+    probe(url, {}, std::move(onResult));
+}
+
+void DownloadManager::probe(const QString& url,
+                            const QList<QPair<QString, QString>>& headers,
+                            std::function<void(ProbeResult)> onResult) {
     engine_->probe(
-        url.toStdString(),
+        url.toStdString(), toEngineHeaders(headers),
         [this, cb = std::move(onResult)](fdm::ProbeResult pr) {
             ProbeResult ui;
             ui.ok = pr.ok;
@@ -216,6 +267,7 @@ fdm::ResumeSpec DownloadManager::buildResumeSpec(const DownloadLiveRow& row) con
     spec.outputPath = row.rec.outputPath.toStdString();
     spec.totalBytes = row.rec.totalBytes;
     spec.supportsRanges = row.rec.supportsRanges;
+    spec.headers = headersFromJson(row.rec.requestHeaders);
     spec.chunks.reserve(row.chunks.size());
     for (const ChunkRecord& c : row.chunks) {
         fdm::ChunkRestore r;
@@ -268,6 +320,7 @@ void DownloadManager::resume(qint64 id) {
         emit rowChanged(id);
         row->engineId = engine_->start(
             row->rec.url.toStdString(), row->rec.outputPath.toStdString(),
+            headersFromJson(row->rec.requestHeaders),
             [this, id](fdm::EngineEvent ev) {
                 QMetaObject::invokeMethod(
                     this, [this, id, ev = std::move(ev)]() mutable {
@@ -319,6 +372,7 @@ void DownloadManager::retry(qint64 id) {
 
     row->engineId = engine_->start(
         row->rec.url.toStdString(), row->rec.outputPath.toStdString(),
+        headersFromJson(row->rec.requestHeaders),
         [this, id](fdm::EngineEvent ev) {
             QMetaObject::invokeMethod(
                 this, [this, id, ev = std::move(ev)]() mutable {

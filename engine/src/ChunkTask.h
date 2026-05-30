@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "fdm/ChunkSpec.h"
 #include "fdm/DownloadEngine.h"
@@ -23,7 +24,10 @@ public:
     // when restoring from persistent state). The constructor advances the
     // file pointer past them and configures CURLOPT_RANGE to resume after
     // them; `attempts` is the attempts counter to restore (1 if fresh).
+    // `headers` are extra request headers (raw "Name: value" lines) sent on
+    // this chunk's request.
     ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
+              std::vector<std::string> headers = {},
               std::int64_t initialBytesReceived = 0, int initialAttempts = 1);
     ~ChunkTask();
 
@@ -58,6 +62,7 @@ private:
     ChunkSpec spec_;
     std::FILE* file_ = nullptr;
     CURL* easy_ = nullptr;
+    struct curl_slist* headers_ = nullptr;  // owned; freed in dtor
     EasyContext ctx_;
     std::int64_t bytesWrittenSoFar_ = 0;
     int attempts_ = 1;  // counts attempts including the first

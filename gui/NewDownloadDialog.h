@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QDialog>
+#include <QList>
+#include <QPair>
 #include <QString>
 
 class QLabel;
@@ -32,6 +34,13 @@ public:
     // existing row). Empty strings leave that field at its default.
     void prefill(const QString& url, const QString& directory,
                  const QString& filename, const QString& expectedHash = QString());
+
+    // Extra request headers (Cookie / Referer / User-Agent) sent on the probe
+    // this dialog runs when the user clicks Start. Needed so an authenticated
+    // URL still resolves its server filename / size. Not shown in the UI.
+    void setRequestHeaders(const QList<QPair<QString, QString>>& headers) {
+        requestHeaders_ = headers;
+    }
 
     // Valid only after exec() returned QDialog::Accepted.
     QString url() const;
@@ -68,6 +77,7 @@ private:
     QString resolvedPath_;
     QString userHash_;
     QString userHashAlgorithm_;
+    QList<QPair<QString, QString>> requestHeaders_;
 };
 
 }  // namespace fdm_gui

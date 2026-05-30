@@ -14,6 +14,7 @@
 namespace fdm {
 
 ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
+                     std::vector<std::string> headers,
                      std::int64_t initialBytesReceived, int initialAttempts)
     : url_(std::move(url)),
       outputPath_(std::move(outputPath)),
@@ -60,6 +61,12 @@ ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
     curl_easy_setopt(easy_, CURLOPT_WRITEFUNCTION, &ChunkTask::writeCallback);
     curl_easy_setopt(easy_, CURLOPT_WRITEDATA, this);
     curl_easy_setopt(easy_, CURLOPT_USERAGENT, "fdm/0.1");
+    // Forward caller-supplied headers (Cookie / Referer / a real browser
+    // User-Agent). A User-Agent here overrides the default set just above.
+    for (const std::string& h : headers) {
+        if (!h.empty()) headers_ = curl_slist_append(headers_, h.c_str());
+    }
+    if (headers_) curl_easy_setopt(easy_, CURLOPT_HTTPHEADER, headers_);
     // Bound how long we'll wait for a dead connection before bailing -- a
     // stalled chunk should fail and trigger retry rather than hang forever.
     curl_easy_setopt(easy_, CURLOPT_CONNECTTIMEOUT, 30L);
@@ -72,6 +79,7 @@ ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
 
 ChunkTask::~ChunkTask() {
     if (easy_) curl_easy_cleanup(easy_);
+    if (headers_) curl_slist_free_all(headers_);
     if (file_) std::fclose(file_);
 }
 

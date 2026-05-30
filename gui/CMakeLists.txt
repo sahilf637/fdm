@@ -8,8 +8,11 @@ add_executable(fdm-gui
   NewDownloadDialog.h
   DownloadDetailsWindow.cpp
   DownloadDetailsWindow.h
+  SingleInstance.cpp
+  SingleInstance.h
 )
-target_link_libraries(fdm-gui PRIVATE fdm_store Qt6::Widgets)
+target_include_directories(fdm-gui PRIVATE ${CMAKE_SOURCE_DIR}/ipc)
+target_link_libraries(fdm-gui PRIVATE fdm_store Qt6::Widgets Qt6::Network)
 
 # Copy the launcher wrapper next to the binary so users can run the GUI from
 # any shell (including snap-confined ones that pollute LD_LIBRARY_PATH).

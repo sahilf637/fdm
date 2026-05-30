@@ -1,8 +1,11 @@
 #pragma once
 
 #include <QHash>
+#include <QList>
 #include <QMainWindow>
+#include <QPair>
 #include <QPointer>
+#include <QString>
 #include <QtGlobal>
 
 class QAction;
@@ -17,6 +20,17 @@ class DownloadManager;
 namespace fdm_gui {
 
 class DownloadDetailsWindow;
+
+// A download handed to us from outside the app (browser extension via the
+// native host, or the --add-download CLI arg). Headers carry auth context
+// (Cookie / Referer / User-Agent) so protected downloads work.
+struct ExternalDownloadRequest {
+    QString url;
+    QString filename;   // suggested leaf name (server-detected if empty)
+    QString dir;        // save directory (dialog default if empty)
+    QString hash;       // optional expected hash hex
+    QList<QPair<QString, QString>> headers;
+};
 
 // Top-level download-history window. Lists every persisted download (live
 // and historical) and lets the user start new ones, pause/resume/cancel
@@ -34,6 +48,16 @@ public:
     // so DownloadDetailsWindow can request a redownload without duplicating
     // the dialog/select-row glue.
     void redownloadFromRow(qint64 id);
+
+    // Raise the window and, if `req.url` is a valid http(s) URL, open the New
+    // Download dialog pre-filled (forwarding auth headers on start).
+    void openExternalDownload(const ExternalDownloadRequest& req);
+
+public slots:
+    // Entry point for IPC payloads (from SingleInstance). An empty/!object
+    // payload just raises the window; otherwise it is parsed into an
+    // ExternalDownloadRequest and opened.
+    void handleIpcMessage(const QByteArray& payload);
 
 private slots:
     void onNewDownloadClicked();

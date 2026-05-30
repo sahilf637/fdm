@@ -406,6 +406,18 @@ std::size_t headerCallback(char* buf, std::size_t size, std::size_t nmemb, void*
     return total;
 }
 
+// Build a curl_slist from raw "Name: value" header lines. Returns nullptr for
+// an empty list. Caller owns the result and must curl_slist_free_all it once
+// the easy handle no longer references it.
+struct curl_slist* buildHeaderList(const std::vector<std::string>& headers) {
+    struct curl_slist* list = nullptr;
+    for (const std::string& h : headers) {
+        if (h.empty()) continue;
+        list = curl_slist_append(list, h.c_str());
+    }
+    return list;
+}
+
 struct ProbeState {
     HeaderState header;
     CURL* easy = nullptr;
@@ -413,6 +425,7 @@ struct ProbeState {
     std::function<void(ProbeResult)> onResult;
     int attempts = 1;
     std::string url;  // kept for diagnostic / re-issue purposes
+    struct curl_slist* headerList = nullptr;  // freed at terminal cleanup
 };
 
 // Write callback for probe: discards the byte we got from "Range: bytes=0-0"
@@ -436,6 +449,7 @@ struct DownloadEngine::DownloadState {
     DownloadId id = 0;
     std::string url;
     std::string outputPath;
+    std::vector<std::string> headers;  // extra request headers, replayed per chunk
     std::function<void(EngineEvent)> onEvent;
     std::int64_t totalBytes = -1;
     bool supportsRanges = false;
@@ -557,10 +571,16 @@ void DownloadEngine::addEasy(CURL* easy) {
 }
 
 void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onResult) {
+    probe(std::move(url), {}, std::move(onResult));
+}
+
+void DownloadEngine::probe(std::string url, std::vector<std::string> headers,
+                           std::function<void(ProbeResult)> onResult) {
     auto* state = new ProbeState();
     state->easy = curl_easy_init();
     state->onResult = std::move(onResult);
     state->url = std::move(url);
+    state->headerList = buildHeaderList(headers);
 
     // Probe by GETting a single-byte range. More robust than HEAD: works on
     // servers that drop HEADs entirely (e.g. some CDNs / nginx configs), and
@@ -575,6 +595,11 @@ void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onR
     curl_easy_setopt(state->easy, CURLOPT_HEADERFUNCTION, headerCallback);
     curl_easy_setopt(state->easy, CURLOPT_HEADERDATA, &state->header);
     curl_easy_setopt(state->easy, CURLOPT_USERAGENT, "fdm/0.1");
+    // Caller-supplied headers (Cookie / Referer / a real browser User-Agent).
+    // A User-Agent here overrides the default set just above.
+    if (state->headerList) {
+        curl_easy_setopt(state->easy, CURLOPT_HTTPHEADER, state->headerList);
+    }
     // Without this, libcurl would deliver an HTML error page to our write
     // callback for 4xx/5xx, and our abort-on-non-206 logic would surface it as
     // CURLE_WRITE_ERROR -- masking the real cause (the HTTP status code).
@@ -607,6 +632,7 @@ void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onR
             if (eff) result.info.finalUrl = eff;
             state->onResult(std::move(result));
             curl_easy_cleanup(state->easy);
+            if (state->headerList) curl_slist_free_all(state->headerList);
             delete state;
         };
 
@@ -634,6 +660,7 @@ void DownloadEngine::probe(std::string url, std::function<void(ProbeResult)> onR
         result.error = describeError(rc, http);
         state->onResult(std::move(result));
         curl_easy_cleanup(state->easy);
+        if (state->headerList) curl_slist_free_all(state->headerList);
         delete state;
     };
     curl_easy_setopt(state->easy, CURLOPT_PRIVATE, &state->ctx);
@@ -711,7 +738,8 @@ void DownloadEngine::launchTasks(DownloadState* state,
                 }
             }
             state->tasks.push_back(std::make_unique<ChunkTask>(
-                state->url, state->outputPath, spec, initBytes, initAttempts));
+                state->url, state->outputPath, spec, state->headers, initBytes,
+                initAttempts));
         }
     } catch (const std::exception& e) {
         state->emit(Failed{e.what()});
@@ -793,14 +821,22 @@ void DownloadEngine::launchTasks(DownloadState* state,
 DownloadId DownloadEngine::start(std::string url,
                                  std::string outputPath,
                                  std::function<void(EngineEvent)> onEvent) {
+    return start(std::move(url), std::move(outputPath), {}, std::move(onEvent));
+}
+
+DownloadId DownloadEngine::start(std::string url,
+                                 std::string outputPath,
+                                 std::vector<std::string> headers,
+                                 std::function<void(EngineEvent)> onEvent) {
     auto* state = new DownloadState();
     state->id = nextId_.fetch_add(1, std::memory_order_relaxed);
     state->url = std::move(url);
     state->outputPath = std::move(outputPath);
+    state->headers = std::move(headers);
     state->onEvent = std::move(onEvent);
     const DownloadId id = state->id;
 
-    probe(state->url, [this, state](ProbeResult pr) {
+    probe(state->url, state->headers, [this, state](ProbeResult pr) {
         if (!pr.ok) {
             state->emit(Failed{pr.error});
             delete state;
@@ -837,6 +873,7 @@ DownloadId DownloadEngine::resumeKnown(ResumeSpec spec,
     state->id = nextId_.fetch_add(1, std::memory_order_relaxed);
     state->url = std::move(spec.url);
     state->outputPath = std::move(spec.outputPath);
+    state->headers = std::move(spec.headers);
     state->onEvent = std::move(onEvent);
     state->totalBytes = spec.totalBytes;
     state->supportsRanges = spec.supportsRanges;

@@ -48,6 +48,10 @@ struct ResumeSpec {
     std::int64_t totalBytes = -1;
     bool supportsRanges = true;
     std::vector<ChunkRestore> chunks;
+    // Extra request headers (raw "Name: value" lines) replayed on every chunk
+    // so an authenticated download (cookies, referer) resumes the same way it
+    // started.
+    std::vector<std::string> headers;
 };
 
 // Attached to a curl easy handle via CURLOPT_PRIVATE. The engine reads this
@@ -83,6 +87,11 @@ public:
     // thread) once the probe completes.
     void probe(std::string url, std::function<void(ProbeResult)> onResult);
 
+    // As above, but sends extra request headers (raw "Name: value" lines) --
+    // e.g. Cookie / Referer / User-Agent forwarded from a browser.
+    void probe(std::string url, std::vector<std::string> headers,
+               std::function<void(ProbeResult)> onResult);
+
     // Start a chunked download. Emits Started, then Progress events, then
     // either Finished or Failed exactly once. All events fire on the engine
     // thread. Pre-allocates the output file when Content-Length is known.
@@ -90,6 +99,13 @@ public:
     // pause/resume/cancel.
     DownloadId start(std::string url,
                      std::string outputPath,
+                     std::function<void(EngineEvent)> onEvent);
+
+    // As above, but sends extra request headers (raw "Name: value" lines) on
+    // the probe and on every chunk request.
+    DownloadId start(std::string url,
+                     std::string outputPath,
+                     std::vector<std::string> headers,
                      std::function<void(EngineEvent)> onEvent);
 
     // Like start(), but skips probing and chunk-splitting -- the caller

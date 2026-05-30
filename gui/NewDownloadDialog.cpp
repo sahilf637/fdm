@@ -228,7 +228,7 @@ void NewDownloadDialog::onAccept() {
     // probe is fire-and-forget on the engine side; we just refuse to act on
     // it after the dialog is gone.
     QPointer<NewDownloadDialog> guard = this;
-    manager_->probe(url, [guard](ProbeResult r) {
+    manager_->probe(url, requestHeaders_, [guard](ProbeResult r) {
         if (!guard) return;
         guard->handleProbeResult(r);
     });

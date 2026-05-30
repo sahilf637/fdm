@@ -3,6 +3,7 @@
 #include <QHash>
 #include <QList>
 #include <QObject>
+#include <QPair>
 #include <QString>
 #include <QtGlobal>
 
@@ -66,11 +67,21 @@ public:
     // row immediately and takes precedence over any server-side discovery.
     qint64 startNew(const QString& url, const QString& outputPath,
                     const QString& userHash, const QString& userHashAlgorithm);
+    // Variant carrying extra request headers (Cookie / Referer / User-Agent,
+    // e.g. forwarded from a browser extension). The headers are persisted and
+    // replayed on resume, and sent on the probe + every chunk request.
+    qint64 startNew(const QString& url, const QString& outputPath,
+                    const QString& userHash, const QString& userHashAlgorithm,
+                    const QList<QPair<QString, QString>>& headers);
 
     // Probe a URL without registering a download. Callback fires on the UI
     // thread (the same thread `this` lives on). Useful for filling in a
     // server-suggested filename before the user commits to a save path.
     void probe(const QString& url, std::function<void(ProbeResult)> onResult);
+    // Variant that sends extra request headers, so an authenticated URL still
+    // resolves its Content-Disposition filename / size at probe time.
+    void probe(const QString& url, const QList<QPair<QString, QString>>& headers,
+               std::function<void(ProbeResult)> onResult);
 
     // Engine-control operations. All are id-addressed and idempotent: e.g.
     // pause() of an already-paused download is a no-op.

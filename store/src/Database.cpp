@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     hash_algorithm  TEXT,
     hash_source     TEXT,
     actual_hash     TEXT,
-    verification    TEXT
+    verification    TEXT,
+    request_headers TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -181,6 +182,7 @@ Database::Database(const QString& dbPath) {
         {"hash_source",    "hash_source TEXT"},
         {"actual_hash",    "actual_hash TEXT"},
         {"verification",   "verification TEXT"},
+        {"request_headers", "request_headers TEXT"},
     };
     for (const Col& c : required) {
         if (existing.contains(c.name)) continue;
@@ -203,8 +205,8 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     q.prepare(
         "INSERT INTO downloads"
         " (url, output_path, total_bytes, supports_ranges, status, error, created_at, updated_at,"
-        "  expected_hash, hash_algorithm, hash_source, actual_hash, verification)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "  expected_hash, hash_algorithm, hash_source, actual_hash, verification, request_headers)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const qint64 now = nowSeconds();
     q.addBindValue(rec.url);
     q.addBindValue(rec.outputPath);
@@ -220,6 +222,7 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     q.addBindValue(rec.actualHash.isEmpty() ? QVariant() : QVariant(rec.actualHash));
     const QString verStr = verificationStatusToString(rec.verification);
     q.addBindValue(verStr.isEmpty() ? QVariant() : QVariant(verStr));
+    q.addBindValue(rec.requestHeaders.isEmpty() ? QVariant() : QVariant(rec.requestHeaders));
     exec(q, "insertDownload");
     return q.lastInsertId().toLongLong();
 }
@@ -359,7 +362,7 @@ namespace {
 constexpr const char* kDownloadSelectColumns =
     "id, url, output_path, total_bytes, supports_ranges, status, error,"
     " created_at, updated_at, expected_hash, hash_algorithm, hash_source,"
-    " actual_hash, verification";
+    " actual_hash, verification, request_headers";
 
 DownloadRecord readDownloadRow(const QSqlQuery& q) {
     DownloadRecord r;
@@ -377,6 +380,7 @@ DownloadRecord readDownloadRow(const QSqlQuery& q) {
     r.hashSource = q.value(11).toString();
     r.actualHash = q.value(12).toString();
     r.verification = verificationStatusFromString(q.value(13).toString());
+    r.requestHeaders = q.value(14).toString();
     return r;
 }
 
