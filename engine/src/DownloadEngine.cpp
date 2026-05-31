@@ -560,10 +560,22 @@ bool preallocateFile(const std::string& path, std::int64_t size, std::string* er
         *error = std::string("open ") + path + ": " + std::strerror(errno);
         return false;
     }
-    if (size > 0 && ::ftruncate(fd, static_cast<off_t>(size)) != 0) {
-        *error = std::string("ftruncate: ") + std::strerror(errno);
-        ::close(fd);
-        return false;
+    if (size > 0) {
+        // posix_fallocate reserves real blocks (vs. ftruncate's sparse hole),
+        // avoiding fragmentation and surfacing ENOSPC now rather than mid-write.
+        // It returns an errno-style code (not via errno) and 0 on success.
+        const int rc = ::posix_fallocate(fd, 0, static_cast<off_t>(size));
+        if (rc == ENOSPC) {
+            *error = std::string("posix_fallocate: ") + std::strerror(rc);
+            ::close(fd);
+            return false;
+        }
+        // Filesystem may not support fallocate -- fall back to a sparse file.
+        if (rc != 0 && ::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+            *error = std::string("ftruncate: ") + std::strerror(errno);
+            ::close(fd);
+            return false;
+        }
     }
     ::close(fd);
     return true;
@@ -582,6 +594,17 @@ struct DownloadEngine::PendingRetry {
 DownloadEngine::DownloadEngine() {
     multi_ = curl_multi_init();
     if (!multi_) throw std::runtime_error("curl_multi_init failed");
+    // Reuse connections, DNS results, and TLS sessions across every handle.
+    // All handles run on the engine thread, so no lock callbacks are needed.
+    share_ = curl_share_init();
+    if (share_) {
+        curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+        curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        curl_share_setopt(share_, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    }
+    // Let chunk requests to an HTTP/2 host multiplex over a single connection
+    // instead of opening (and handshaking) a fresh one each. No-op on HTTP/1.x.
+    curl_multi_setopt(multi_, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
     thread_ = std::thread([this] { runLoop(); });
 }
 
@@ -600,6 +623,8 @@ DownloadEngine::~DownloadEngine() {
     }
     activeStates_.clear();
     if (multi_) curl_multi_cleanup(multi_);
+    // Cleaned up only after every easy handle that referenced it is gone.
+    if (share_) curl_share_cleanup(share_);
 }
 
 void DownloadEngine::post(std::function<void()> cmd) {
@@ -652,6 +677,9 @@ void DownloadEngine::probe(std::string url, std::vector<std::string> headers,
     curl_easy_setopt(state->easy, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(state->easy, CURLOPT_LOW_SPEED_TIME, 15L);
     curl_easy_setopt(state->easy, CURLOPT_NOSIGNAL, 1L);
+    // Warm the shared TLS-session / connection cache so the chunk requests that
+    // follow can resume this probe's session instead of re-handshaking.
+    if (share_) curl_easy_setopt(state->easy, CURLOPT_SHARE, share_);
 
     state->ctx.onDone = [this, state](CURLcode rc) {
         long http = 0;
@@ -983,6 +1011,12 @@ DownloadId DownloadEngine::start(std::string url,
             delete state;
             return;
         }
+
+        // Download the chunks straight from the post-redirect URL so each
+        // connection (and every retry) skips re-walking the redirect chain.
+        // FOLLOWLOCATION stays on per chunk as a safety net if it redirects
+        // again; an expired signed URL surfaces as a normal HTTP failure.
+        if (!pr.info.finalUrl.empty()) state->url = pr.info.finalUrl;
 
         state->totalBytes = pr.info.contentLength;
         state->supportsRanges = pr.info.supportsRanges;

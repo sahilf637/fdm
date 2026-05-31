@@ -3,7 +3,6 @@
 #include <curl/curl.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <functional>
 #include <string>
 #include <vector>
@@ -70,7 +69,7 @@ private:
     std::string url_;
     std::string outputPath_;
     ChunkSpec spec_;
-    std::FILE* file_ = nullptr;
+    int fd_ = -1;  // owned; closed in dtor. Written via pwrite at absolute offsets.
     CURL* easy_ = nullptr;
     struct curl_slist* headers_ = nullptr;  // owned; freed in dtor
     EasyContext ctx_;

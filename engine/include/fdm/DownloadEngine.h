@@ -83,6 +83,11 @@ public:
     // set CURLOPT_PRIVATE to an EasyContext* (or nullptr).
     void addEasy(CURL* easy);
 
+    // Shared DNS / TLS-session / connection cache applied to every easy handle
+    // (probe + chunks). Lets parallel chunks resume TLS sessions and reuse
+    // connections instead of each paying a fresh handshake. Owned by the engine.
+    CURLSH* shareHandle() const { return share_; }
+
     // HEAD-request a URL on the engine thread. onResult fires (on the engine
     // thread) once the probe completes.
     void probe(std::string url, std::function<void(ProbeResult)> onResult);
@@ -157,6 +162,7 @@ private:
     void failDownload(DownloadState* state, const std::string& reason);
 
     CURLM* multi_ = nullptr;
+    CURLSH* share_ = nullptr;
     std::thread thread_;
     std::mutex mu_;
     std::deque<std::function<void()>> commands_;
