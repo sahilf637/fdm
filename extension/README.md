@@ -55,6 +55,16 @@ extension/install-host.sh --chrome-id <ID from chrome://extensions>
 
 Re-run with a different `--host-path` if your host binary lives elsewhere.
 
+> **⚠️ Snap Firefox (Ubuntu default) is not supported.** The strictly-confined
+> Firefox snap will not launch an external native-messaging host: it finds the
+> manifest but the spawn fails inside the sandbox ("An unexpected error
+> occurred"), and its runtime ships no Qt for the host anyway. There is no
+> manifest/wrapper workaround. Use the **non-snap Firefox** (Mozilla's `.deb`
+> from <https://packages.mozilla.org/apt>) or Chrome/Chromium `.deb`, which run
+> unconfined and read `~/.mozilla/native-messaging-hosts/` normally.
+> `install-host.sh` still writes to the snap/flatpak manifest dirs when present
+> (correct location, harmless), but the snap sandbox is the blocker.
+
 ### 4. Verify
 
 Open the extension popup → **Test connection** → should say *connected*. Then

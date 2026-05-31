@@ -66,6 +66,15 @@ echo "host binary: $HOST_PATH"
 
 echo "Firefox:"
 write_firefox_manifest "$HOME/.mozilla/native-messaging-hosts"
+# Snap and Flatpak Firefox are sandboxed: each runs with $HOME inside its own
+# data tree, so it ignores ~/.mozilla and reads native-host manifests from a
+# private location. Install there too when those packages are present.
+if [[ -d "$HOME/snap/firefox" ]]; then
+  write_firefox_manifest "$HOME/snap/firefox/common/.mozilla/native-messaging-hosts"
+fi
+if [[ -d "$HOME/.var/app/org.mozilla.firefox" ]]; then
+  write_firefox_manifest "$HOME/.var/app/org.mozilla.firefox/.mozilla/native-messaging-hosts"
+fi
 
 echo "Chrome / Chromium:"
 if [[ -n "$CHROME_ID" ]]; then

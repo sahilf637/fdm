@@ -25,7 +25,10 @@ function checkConnection() {
   // ping = liveness check; the host answers without opening a download dialog.
   chrome.runtime.sendNativeMessage(HOST, { ping: true }, (resp) => {
     if (chrome.runtime.lastError) {
-      renderStatus("bad", "Native host not registered");
+      const msg = chrome.runtime.lastError.message || "Native host not registered";
+      console.error("FDM native messaging error:", msg);
+      renderStatus("bad", msg);
+      statusText.title = msg;  // full text on hover (the chip truncates)
     } else if (resp && resp.ok) {
       renderStatus("ok", "Connected to FDM");
     } else {
