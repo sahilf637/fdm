@@ -118,16 +118,18 @@ VerificationStatus verificationStatusFromString(const QString& s) {
 
 QString chunkStatusToString(ChunkPersistStatus s) {
     switch (s) {
-        case ChunkPersistStatus::Active: return "active";
-        case ChunkPersistStatus::Done:   return "done";
-        case ChunkPersistStatus::Failed: return "failed";
+        case ChunkPersistStatus::Active:  return "active";
+        case ChunkPersistStatus::Pending: return "pending";
+        case ChunkPersistStatus::Done:    return "done";
+        case ChunkPersistStatus::Failed:  return "failed";
     }
     return "active";
 }
 
 ChunkPersistStatus chunkStatusFromString(const QString& s) {
-    if (s == "done")   return ChunkPersistStatus::Done;
-    if (s == "failed") return ChunkPersistStatus::Failed;
+    if (s == "pending") return ChunkPersistStatus::Pending;
+    if (s == "done")    return ChunkPersistStatus::Done;
+    if (s == "failed")  return ChunkPersistStatus::Failed;
     return ChunkPersistStatus::Active;
 }
 

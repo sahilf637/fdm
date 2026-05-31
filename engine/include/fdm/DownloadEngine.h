@@ -132,13 +132,29 @@ public:
     // and are opaque to anyone including this header.
     struct PendingRetry;
     struct DownloadState;
+    struct Segment;
 
 private:
     void runLoop();
-    // Helpers shared by start() and resumeKnown(). Engine-thread-only.
     DownloadState* findById(DownloadId id);
-    void launchTasks(DownloadState* state, const std::vector<ChunkSpec>& chunks,
-                     const std::vector<ChunkRestore>* restoreOverlay);
+
+    // --- segment scheduler (engine-thread-only) ------------------------------
+    // Set up a fresh download's initial segments from `chunks`, emit Started,
+    // register it, and start pumping. `restoreOverlay` carries per-segment
+    // resume state (nullptr for a brand-new download).
+    void beginDownload(DownloadState* state, const std::vector<ChunkSpec>& chunks,
+                       const std::vector<ChunkRestore>* restoreOverlay);
+    // Fill free connection slots: start Pending segments whose backoff has
+    // elapsed, and split the largest in-flight segment when nothing is pending.
+    void pump(DownloadState* state);
+    void startSegment(DownloadState* state, Segment* seg);
+    Segment* findSegment(DownloadState* state, int index);
+    Segment* trySplitLargestActive(DownloadState* state);
+    // Per-segment terminal handler invoked from the curl completion callback.
+    void onSegmentDone(DownloadState* state, int segIndex, CURLcode rc, long http,
+                       bool capped);
+    void maybeFinish(DownloadState* state);   // emit Finished when all segments Done
+    void failDownload(DownloadState* state, const std::string& reason);
 
     CURLM* multi_ = nullptr;
     std::thread thread_;

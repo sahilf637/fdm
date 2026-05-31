@@ -20,7 +20,7 @@ enum class DownloadStatus {
     Failed,
 };
 
-enum class ChunkPersistStatus { Active, Done, Failed };
+enum class ChunkPersistStatus { Active, Pending, Done, Failed };
 
 // Lifecycle of the optional hash check. `Pending` means we know we WILL try
 // to verify (a hash has been recorded); `Unverified` means we tried and

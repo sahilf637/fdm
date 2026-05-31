@@ -1,0 +1,9 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="fdm-16.png">icons/fdm-16.png</file>
+    <file alias="fdm-32.png">icons/fdm-32.png</file>
+    <file alias="fdm-48.png">icons/fdm-48.png</file>
+    <file alias="fdm-128.png">icons/fdm-128.png</file>
+    <file alias="fdm-256.png">icons/fdm-256.png</file>
+  </qresource>
+</RCC>

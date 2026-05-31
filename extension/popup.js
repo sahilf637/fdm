@@ -1,7 +1,10 @@
 const HOST = "com.fdm.native_host";
 const enabledBox = document.getElementById("enabled");
-const statusEl = document.getElementById("status");
+const statusDot = document.getElementById("statusDot");
+const statusText = document.getElementById("statusText");
+const recheckBtn = document.getElementById("recheck");
 
+// --- toggle ---------------------------------------------------------------
 chrome.storage.local.get({ enabled: true }).then(({ enabled }) => {
   enabledBox.checked = enabled;
 });
@@ -10,16 +13,26 @@ enabledBox.addEventListener("change", () => {
   chrome.storage.local.set({ enabled: enabledBox.checked });
 });
 
-document.getElementById("test").addEventListener("click", () => {
-  statusEl.textContent = "…";
+// --- connection status ----------------------------------------------------
+// state: "checking" | "ok" | "bad"
+function renderStatus(state, text) {
+  statusDot.className = "dot " + state;
+  statusText.textContent = text;
+}
+
+function checkConnection() {
+  renderStatus("checking", "Checking…");
   // ping = liveness check; the host answers without opening a download dialog.
   chrome.runtime.sendNativeMessage(HOST, { ping: true }, (resp) => {
     if (chrome.runtime.lastError) {
-      statusEl.textContent = "host not found";
+      renderStatus("bad", "Native host not registered");
     } else if (resp && resp.ok) {
-      statusEl.textContent = "connected";
+      renderStatus("ok", "Connected to FDM");
     } else {
-      statusEl.textContent = "error: " + (resp && resp.error);
+      renderStatus("bad", "Error: " + (resp && resp.error));
     }
   });
-});
+}
+
+recheckBtn.addEventListener("click", checkConnection);
+checkConnection();

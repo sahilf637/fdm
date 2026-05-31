@@ -10,6 +10,7 @@ add_executable(fdm_tests
   test_engine_disposition.cpp
   test_engine_digest.cpp
   test_engine_headers.cpp
+  test_engine_concurrency.cpp
   test_paths.cpp
 )
 target_include_directories(fdm_tests PRIVATE

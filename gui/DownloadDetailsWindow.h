@@ -57,11 +57,14 @@ private:
     bool lastStatusKnown_ = false;
 
     QLabel* nameLabel_ = nullptr;
+    QLabel* statusPill_ = nullptr;
     QLabel* urlLabel_ = nullptr;
     QLabel* pathLabel_ = nullptr;
-    QLabel* sizeLabel_ = nullptr;
-    QLabel* statusLabel_ = nullptr;
+    QLabel* sizeLabel_ = nullptr;     // received / total
+    QLabel* statusLabel_ = nullptr;   // verification badge / error detail
     QLabel* speedLabel_ = nullptr;
+    QLabel* etaLabel_ = nullptr;
+    QLabel* connLabel_ = nullptr;     // active / limit connections
     QProgressBar* overallBar_ = nullptr;
     QTableWidget* chunkTable_ = nullptr;
     QPushButton* pauseBtn_ = nullptr;

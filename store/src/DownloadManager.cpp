@@ -36,18 +36,20 @@ constexpr qint64 kPersistThrottleMs = 2000;  // flush chunk progress at most eve
 
 ChunkPersistStatus toPersistStatus(fdm::ChunkProgress::Status s) {
     switch (s) {
-        case fdm::ChunkProgress::Status::Done:   return ChunkPersistStatus::Done;
-        case fdm::ChunkProgress::Status::Failed: return ChunkPersistStatus::Failed;
-        case fdm::ChunkProgress::Status::Active: return ChunkPersistStatus::Active;
+        case fdm::ChunkProgress::Status::Done:    return ChunkPersistStatus::Done;
+        case fdm::ChunkProgress::Status::Failed:  return ChunkPersistStatus::Failed;
+        case fdm::ChunkProgress::Status::Pending: return ChunkPersistStatus::Pending;
+        case fdm::ChunkProgress::Status::Active:  return ChunkPersistStatus::Active;
     }
     return ChunkPersistStatus::Active;
 }
 
 fdm::ChunkProgress::Status fromPersistStatus(ChunkPersistStatus s) {
     switch (s) {
-        case ChunkPersistStatus::Done:   return fdm::ChunkProgress::Status::Done;
-        case ChunkPersistStatus::Failed: return fdm::ChunkProgress::Status::Failed;
-        case ChunkPersistStatus::Active: return fdm::ChunkProgress::Status::Active;
+        case ChunkPersistStatus::Done:    return fdm::ChunkProgress::Status::Done;
+        case ChunkPersistStatus::Failed:  return fdm::ChunkProgress::Status::Failed;
+        case ChunkPersistStatus::Pending: return fdm::ChunkProgress::Status::Pending;
+        case ChunkPersistStatus::Active:  return fdm::ChunkProgress::Status::Active;
     }
     return fdm::ChunkProgress::Status::Active;
 }
@@ -447,15 +449,27 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 }
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Progress>) {
+                // Dynamic re-segmentation grows the segment set at runtime. When
+                // the count changes, rewrite the whole chunk layout (insert the
+                // new rows); otherwise just update byte counts in place.
+                const bool layoutChanged =
+                    row->chunks.size() != static_cast<int>(e.chunks.size());
                 row->chunks = chunksFromProgress(e.chunks);
                 row->bytesReceived = e.received;
+                row->activeConnections = e.activeConnections;
+                row->connectionLimit = e.connectionLimit;
                 // EMA on the raw 100ms-window rate the engine reports.
                 constexpr double kAlpha = 0.2;
                 row->bytesPerSec = (row->bytesPerSec <= 0)
                                        ? e.bytesPerSec
                                        : kAlpha * e.bytesPerSec +
                                              (1.0 - kAlpha) * row->bytesPerSec;
-                persistProgressThrottled(id);
+                if (layoutChanged) {
+                    db_->replaceChunks(id, row->chunks);
+                    lastPersistMs_[id] = QDateTime::currentMSecsSinceEpoch();
+                } else {
+                    persistProgressThrottled(id);
+                }
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Paused>) {
                 row->rec.status = DownloadStatus::Paused;

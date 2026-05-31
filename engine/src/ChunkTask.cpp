@@ -21,6 +21,9 @@ ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
       spec_(spec),
       bytesWrittenSoFar_(initialBytesReceived),
       attempts_(initialAttempts < 1 ? 1 : initialAttempts) {
+    // Effective end starts at the segment's declared end; dynamic
+    // re-segmentation may lower it later via capEndAt().
+    capEnd_ = spec_.endByte;
     const int fd = ::open(outputPath_.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
         throw std::runtime_error(std::string("open ") + outputPath_ + ": " +
@@ -127,6 +130,7 @@ bool ChunkTask::reconfigureForResume() {
 std::size_t ChunkTask::writeCallback(char* ptr, std::size_t size, std::size_t nmemb,
                                      void* userp) {
     auto* self = static_cast<ChunkTask*>(userp);
+    const std::size_t total = size * nmemb;
 
     // Defense against servers that lie about range support: if we asked for a
     // Range but the server returned 200 (full body) instead of 206, writing
@@ -139,10 +143,35 @@ std::size_t ChunkTask::writeCallback(char* ptr, std::size_t size, std::size_t nm
         if (http == 200) return 0;
     }
 
-    const std::size_t total = size * nmemb;
-    const std::size_t written = std::fwrite(ptr, 1, total, self->file_);
-    self->bytesWrittenSoFar_ += static_cast<std::int64_t>(written);
-    return written;
+    // Open-ended segment (unknown size / no ranges): write everything.
+    if (self->capEnd_ < 0) {
+        const std::size_t w = std::fwrite(ptr, 1, total, self->file_);
+        self->bytesWrittenSoFar_ += static_cast<std::int64_t>(w);
+        return w;  // short write -> WRITE_ERROR (disk error)
+    }
+
+    // Ranged/capped segment: never write past the effective end. When dynamic
+    // re-segmentation lowers the cap, we stop here and flag a clean finish so
+    // the engine hands the tail to a new segment.
+    const std::int64_t pos = self->spec_.startByte + self->bytesWrittenSoFar_;
+    const std::int64_t want = self->capEnd_ - pos + 1;  // bytes still wanted
+    if (want <= 0) {
+        self->cappedComplete_ = true;
+        return 0;  // nothing more wanted -> abort cleanly (capped)
+    }
+    const std::size_t writeN = (static_cast<std::int64_t>(total) <= want)
+                                   ? total
+                                   : static_cast<std::size_t>(want);
+    const std::size_t w = std::fwrite(ptr, 1, writeN, self->file_);
+    self->bytesWrittenSoFar_ += static_cast<std::int64_t>(w);
+    if (w < writeN) {
+        return w;  // disk short-write -> WRITE_ERROR (real error, not capped)
+    }
+    if (writeN < total) {
+        // Wrote exactly up to the cap; short-return to stop the transfer.
+        self->cappedComplete_ = true;
+    }
+    return w;  // == total: continue; < total: clean capped stop
 }
 
 }  // namespace fdm

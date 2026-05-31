@@ -49,6 +49,16 @@ public:
     // chunk is already complete.
     bool reconfigureForResume();
 
+    // Lower this chunk's effective end (dynamic re-segmentation): the write
+    // callback stops once it has written up to `newEnd` (inclusive), at which
+    // point the transfer aborts cleanly and cappedComplete() returns true. The
+    // tail past newEnd is handed to a new segment. Engine-thread only.
+    void capEndAt(std::int64_t newEnd) { capEnd_ = newEnd; }
+
+    // True when the transfer ended because it reached the (possibly lowered)
+    // end cap -- i.e. this byte range is fully on disk, not a failure.
+    bool cappedComplete() const { return cappedComplete_; }
+
     std::int64_t bytesWritten() const { return bytesWrittenSoFar_; }
     const ChunkSpec& spec() const { return spec_; }
     int attempts() const { return attempts_; }
@@ -66,6 +76,8 @@ private:
     EasyContext ctx_;
     std::int64_t bytesWrittenSoFar_ = 0;
     int attempts_ = 1;  // counts attempts including the first
+    std::int64_t capEnd_ = -1;       // effective inclusive end; -1 = open-ended
+    bool cappedComplete_ = false;    // reached the cap (clean finish, not an error)
 };
 
 }  // namespace fdm

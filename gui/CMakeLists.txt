@@ -1,4 +1,5 @@
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 add_executable(fdm-gui
   main.cpp
@@ -10,6 +11,7 @@ add_executable(fdm-gui
   DownloadDetailsWindow.h
   SingleInstance.cpp
   SingleInstance.h
+  fdm.qrc
 )
 target_include_directories(fdm-gui PRIVATE ${CMAKE_SOURCE_DIR}/ipc)
 target_link_libraries(fdm-gui PRIVATE fdm_store Qt6::Widgets Qt6::Network)

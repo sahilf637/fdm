@@ -9,9 +9,14 @@
 
 namespace fdm {
 
-// Per-chunk live progress, populated for every Progress event.
+// Per-segment live progress, populated for every Progress event.
 struct ChunkProgress {
-    enum class Status { Active, Done, Failed };
+    // Active   = downloading right now.
+    // Pending  = waiting for a free connection slot, or backing off after a
+    //            transient error (429 / reset / timeout) before being retried.
+    // Done     = this byte range is fully on disk.
+    // Failed   = a fatal error on this segment (kills the whole download).
+    enum class Status { Active, Pending, Done, Failed };
 
     int index = 0;
     std::int64_t startByte = 0;
@@ -38,6 +43,8 @@ struct Progress {
     std::int64_t total = -1;
     double bytesPerSec = 0.0;         // instantaneous rate since the previous Progress event
     std::vector<ChunkProgress> chunks;
+    int activeConnections = 0;        // segments downloading right now
+    int connectionLimit = 0;          // current adaptive cap on parallel connections
 };
 
 struct Finished {};

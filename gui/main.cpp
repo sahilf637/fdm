@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QDir>
+#include <QIcon>
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <QStringList>
@@ -48,6 +49,19 @@ int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("fdm");
     app.setOrganizationName("fdm");
+    // Lets GNOME/Wayland match this window to fdm.desktop (via WM_CLASS / app_id)
+    // and show its Icon= in the dock + alt-tab. Pairs with install-desktop.sh.
+    app.setDesktopFileName("fdm");
+
+    // Window/taskbar icon (same mark as the browser extension). Multiple sizes
+    // so it stays crisp from the title bar up to the task switcher.
+    QIcon icon;
+    for (const char* res : {":/icons/fdm-16.png", ":/icons/fdm-32.png",
+                            ":/icons/fdm-48.png", ":/icons/fdm-128.png",
+                            ":/icons/fdm-256.png"}) {
+        icon.addFile(res);
+    }
+    app.setWindowIcon(icon);
 
     const QByteArray launchPayload = downloadRequestFromArgs(app.arguments());
 

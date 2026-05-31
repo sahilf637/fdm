@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -121,7 +122,7 @@ std::string readFile(const fs::path& p) {
 
 }  // namespace
 
-TEST_CASE("8 MiB local download splits into 8 parallel chunks, bytes match source") {
+TEST_CASE("8 MiB local download splits into parallel segments, bytes match source") {
     const fs::path tmp = fs::temp_directory_path() / "fdm_local_test";
     std::error_code ec;
     fs::remove_all(tmp, ec);
@@ -176,7 +177,11 @@ TEST_CASE("8 MiB local download splits into 8 parallel chunks, bytes match sourc
     }
 
     REQUIRE_MESSAGE(ok, "download failed: " << error);
-    CHECK(chunkCount == 8);
+    // Adaptive engine seeds kInitialConnections segments (parallel) and grows up
+    // to kMaxConnections dynamically. Assert it split into multiple parallel
+    // segments (not a single stream) rather than a fixed count.
+    CHECK(chunkCount >= 2);
+    CHECK(chunkCount <= 8);
 
     const std::string downloaded = readFile(outputPath);
     CHECK(downloaded.size() == kSize);

@@ -39,6 +39,11 @@ struct DownloadLiveRow {
     double bytesPerSec = 0.0;
     fdm::DownloadId engineId = 0;  // 0 when not currently in the engine
     QList<ChunkRecord> chunks;
+    // Live connection telemetry from the engine's latest Progress (not
+    // persisted): how many segments are downloading right now and the current
+    // adaptive cap.
+    int activeConnections = 0;
+    int connectionLimit = 0;
 };
 
 // Coordinates the persistent store, the libcurl engine, and the live in-
