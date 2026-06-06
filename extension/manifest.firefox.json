@@ -9,12 +9,28 @@
     "nativeMessaging",
     "contextMenus",
     "storage",
-    "notifications"
+    "notifications",
+    "webRequest"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
     "scripts": ["background.js"]
   },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["eme-hook.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": {
     "default_title": "FDM Integration",
     "default_popup": "popup.html",

@@ -1,7 +1,9 @@
 #include "fdm/store/DownloadManager.h"
 
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QFuture>
@@ -10,8 +12,11 @@
 #include <QJsonDocument>
 #include <QMetaObject>
 #include <QPointer>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QtConcurrent>
 
+#include <memory>
 #include <utility>
 #include <variant>
 
@@ -33,6 +38,31 @@ QCryptographicHash::Algorithm qtAlgFor(const QString& alg) {
 namespace {
 
 constexpr qint64 kPersistThrottleMs = 2000;  // flush chunk progress at most every 2s
+
+// Locate a helper binary: prefer one shipped next to the app (or in the build
+// tree's host/ dir), else fall back to PATH. Empty if not found anywhere.
+QString findHelper(const QString& name) {
+    const QString dir = QCoreApplication::applicationDirPath();
+    for (const QString& c : {dir + "/" + name, dir + "/../host/" + name}) {
+        const QFileInfo fi(c);
+        if (fi.exists() && fi.isExecutable()) return fi.absoluteFilePath();
+    }
+    return QStandardPaths::findExecutable(name);
+}
+
+// Strip path separators / control chars from a video title so it's safe as a
+// leaf filename. Falls back to "video" and caps the length.
+QString sanitizeLeaf(const QString& title) {
+    QString out;
+    for (const QChar c : title) {
+        if (c == '/' || c == '\\') continue;
+        if (c.unicode() < 0x20 || c.unicode() == 0x7F) continue;
+        out += c;
+    }
+    out = out.trimmed();
+    if (out.isEmpty()) out = QStringLiteral("video");
+    return out.left(180);
+}
 
 ChunkPersistStatus toPersistStatus(fdm::ChunkProgress::Status s) {
     switch (s) {
@@ -239,6 +269,218 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
     return id;
 }
 
+qint64 DownloadManager::startVideo(const QString& url, const QString& selector,
+                                   const QString& title, const QString& outputDir,
+                                   const QList<QPair<QString, QString>>& headers) {
+    DownloadRecord rec;
+    rec.url = url;
+    rec.kind = "video";
+    rec.videoSelector =
+        selector.isEmpty() ? QStringLiteral("bestvideo*+bestaudio/best") : selector;
+    // Provisional path; yt-dlp reports the real extension after muxing and we
+    // adopt it then (see finishVideo).
+    rec.outputPath = QDir(outputDir).filePath(sanitizeLeaf(title) + ".mp4");
+    rec.status = DownloadStatus::Active;
+    rec.createdAt = QDateTime::currentSecsSinceEpoch();
+    rec.requestHeaders = headersToJson(headers);
+    const qint64 id = db_->insertDownload(rec);
+
+    DownloadLiveRow row;
+    row.rec = rec;
+    row.rec.id = id;
+    rows_.insert(id, row);
+    rowOrder_.append(id);
+    emit rowAdded(id);
+
+    spawnVideo(id);
+    return id;
+}
+
+void DownloadManager::spawnVideo(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+
+    const QString ytdlp = findHelper("yt-dlp");
+    if (ytdlp.isEmpty()) {
+        finishVideo(id, false, "yt-dlp not found");
+        return;
+    }
+
+    const QFileInfo out(row->rec.outputPath);
+    const QString dir = out.absolutePath();
+
+    QStringList args;
+    args << "-f" << row->rec.videoSelector << "--no-playlist" << "--newline"
+         << "--no-mtime" << "--no-simulate" << "--no-warnings"
+         << "--merge-output-format" << "mp4" << "--progress-template"
+         << "FDMPROG|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
+            "%(progress.total_bytes_estimate)s|%(progress.speed)s"
+         << "--print" << "after_move:filepath"
+         // Name by the video's real title (finishVideo adopts the actual path).
+         // The provisional row name still shows whatever title we were given.
+         << "-o" << QDir(dir).filePath("%(title)s.%(ext)s");
+    const QString ffmpeg = findHelper("ffmpeg");
+    if (!ffmpeg.isEmpty()) args << "--ffmpeg-location" << ffmpeg;
+    // Forward UA and any extra headers, but NOT cookies: a logged-in YouTube
+    // session forces the PO-token-gated web client, which yields no usable
+    // formats ("Requested format is not available").
+    for (const std::string& h : headersFromJson(row->rec.requestHeaders)) {
+        const QString line = QString::fromStdString(h);
+        const int sep = line.indexOf(": ");
+        if (sep < 0) continue;
+        const QString name = line.left(sep);
+        if (name.compare("Cookie", Qt::CaseInsensitive) == 0) continue;
+        if (name.compare("User-Agent", Qt::CaseInsensitive) == 0)
+            args << "--user-agent" << line.mid(sep + 2);
+        else
+            args << "--add-header" << line;
+    }
+    args << "--" << row->rec.url;
+
+    auto* proc = new QProcess(this);
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+    videoProcs_.insert(id, proc);
+    videoFinalPath_.remove(id);
+
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, id, proc]() {
+        while (proc->canReadLine()) {
+            const QString line = QString::fromUtf8(proc->readLine()).trimmed();
+            if (!line.isEmpty()) onVideoLine(id, line);
+        }
+    });
+    connect(proc, &QProcess::finished, this,
+            [this, id](int code, QProcess::ExitStatus status) {
+                const bool ok = status == QProcess::NormalExit && code == 0;
+                finishVideo(id, ok,
+                            ok ? QString()
+                               : QStringLiteral("yt-dlp exited with code %1").arg(code));
+            });
+
+    row->rec.status = DownloadStatus::Active;
+    row->rec.error.clear();
+    db_->updateDownloadStatus(id, DownloadStatus::Active);
+    emit rowChanged(id);
+
+    proc->start(ytdlp, args);
+}
+
+void DownloadManager::onVideoLine(qint64 id, const QString& line) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+
+    if (line.startsWith("FDMPROG|")) {
+        const QStringList p = line.split('|');
+        if (p.size() < 5) return;
+        auto num = [](const QString& s) -> qint64 {
+            bool ok = false;
+            const qint64 v = s.toLongLong(&ok);
+            return ok ? v : -1;
+        };
+        const qint64 dl = num(p[1]);
+        qint64 total = num(p[2]);
+        if (total < 0) total = num(p[3]);  // fall back to the estimate
+        bool sok = false;
+        const double speed = p[4].toDouble(&sok);
+        if (dl >= 0) row->bytesReceived = dl;
+        if (total > 0) row->rec.totalBytes = total;
+        row->bytesPerSec = sok ? speed : 0.0;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (row->rec.totalBytes > 0 &&
+            now - lastPersistMs_.value(id, 0) >= kPersistThrottleMs) {
+            lastPersistMs_[id] = now;
+            db_->updateDownloadTotals(id, row->rec.totalBytes, false);
+        }
+        emit rowChanged(id);
+        return;
+    }
+
+    // yt-dlp's `after_move:filepath` print: the finished file's absolute path.
+    if (line.startsWith('/') &&
+        QFileInfo(line).absolutePath() == QFileInfo(row->rec.outputPath).absolutePath()) {
+        videoFinalPath_[id] = line;
+    }
+}
+
+void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
+    if (auto it = videoProcs_.find(id); it != videoProcs_.end()) {
+        it.value()->deleteLater();
+        videoProcs_.erase(it);
+    }
+    DownloadLiveRow* row = find(id);
+    if (!row) {  // removed while running
+        videoIntent_.remove(id);
+        videoFinalPath_.remove(id);
+        return;
+    }
+    row->bytesPerSec = 0;
+    const QString intent = videoIntent_.take(id);
+
+    if (intent == "cancel") {
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.error = "Cancelled";
+        db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
+        videoFinalPath_.remove(id);
+        emit rowChanged(id);
+        return;
+    }
+    if (intent == "pause") {
+        row->rec.status = DownloadStatus::Paused;
+        db_->updateDownloadStatus(id, DownloadStatus::Paused);
+        emit rowChanged(id);
+        return;
+    }
+    if (ok) {
+        const QString fp = videoFinalPath_.take(id);
+        if (!fp.isEmpty() && fp != row->rec.outputPath) {
+            row->rec.outputPath = fp;
+            db_->updateDownloadOutputPath(id, fp);
+        }
+        if (row->rec.totalBytes <= 0 && row->bytesReceived > 0) {
+            row->rec.totalBytes = row->bytesReceived;
+        } else if (row->rec.totalBytes > 0) {
+            row->bytesReceived = row->rec.totalBytes;
+        }
+        row->rec.status = DownloadStatus::Completed;
+        row->rec.verification = VerificationStatus::Unverified;
+        if (row->rec.totalBytes > 0) db_->updateDownloadTotals(id, row->rec.totalBytes, false);
+        db_->updateDownloadStatus(id, DownloadStatus::Completed);
+        db_->updateVerificationStatus(id, VerificationStatus::Unverified);
+        emit rowChanged(id);
+    } else {
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.error = error.isEmpty() ? QStringLiteral("video download failed") : error;
+        db_->updateDownloadStatus(id, DownloadStatus::Failed, row->rec.error);
+        videoFinalPath_.remove(id);
+        emit rowChanged(id);
+    }
+}
+
+void DownloadManager::updateVideoBackend(std::function<void(bool, QString)> done) {
+    const QString ytdlp = findHelper("yt-dlp");
+    if (ytdlp.isEmpty()) {
+        if (done) done(false, "yt-dlp not found");
+        return;
+    }
+    auto* proc = new QProcess(this);
+    proc->setProcessChannelMode(QProcess::MergedChannels);
+    auto fired = std::make_shared<bool>(false);
+    auto finish = [proc, done, fired](bool ok, const QString& fallback) {
+        if (*fired) return;  // finished() and errorOccurred() can both fire
+        *fired = true;
+        QString out = QString::fromUtf8(proc->readAll()).trimmed();
+        if (out.isEmpty()) out = fallback;
+        proc->deleteLater();
+        if (done) done(ok, out);
+    };
+    connect(proc, &QProcess::finished, this, [finish](int code, QProcess::ExitStatus st) {
+        finish(st == QProcess::NormalExit && code == 0, QStringLiteral("Done."));
+    });
+    connect(proc, &QProcess::errorOccurred, this, [finish](QProcess::ProcessError) {
+        finish(false, QStringLiteral("Failed to run yt-dlp."));
+    });
+    proc->start(ytdlp, {"-U"});
+}
+
 void DownloadManager::probe(const QString& url,
                             std::function<void(ProbeResult)> onResult) {
     probe(url, {}, std::move(onResult));
@@ -287,6 +529,13 @@ fdm::ResumeSpec DownloadManager::buildResumeSpec(const DownloadLiveRow& row) con
 void DownloadManager::pause(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
+    if (row->rec.kind == "video") {
+        if (auto* p = videoProcs_.value(id, nullptr)) {
+            videoIntent_[id] = "pause";
+            p->terminate();  // yt-dlp leaves a .part; resume continues it
+        }
+        return;
+    }
     if (row->engineId == 0) {
         // Not currently in the engine -- nothing to ask the engine to do.
         // If we somehow got here for an Active row, sync the DB to Paused.
@@ -303,6 +552,10 @@ void DownloadManager::pause(qint64 id) {
 void DownloadManager::resume(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
+    if (row->rec.kind == "video") {
+        if (!videoProcs_.contains(id)) spawnVideo(id);  // re-run; continues .part
+        return;
+    }
     if (row->engineId != 0) {
         // It's still in the engine and paused: just resume in place.
         engine_->resume(row->engineId);
@@ -351,6 +604,13 @@ void DownloadManager::resume(qint64 id) {
 void DownloadManager::retry(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
+    if (row->rec.kind == "video") {
+        if (videoProcs_.contains(id)) return;
+        row->bytesReceived = 0;
+        row->rec.error.clear();
+        spawnVideo(id);
+        return;
+    }
     if (row->engineId != 0) {
         engine_->cancel(row->engineId);
         row->engineId = 0;
@@ -387,6 +647,18 @@ void DownloadManager::retry(qint64 id) {
 void DownloadManager::cancel(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
+    if (row->rec.kind == "video") {
+        if (auto* p = videoProcs_.value(id, nullptr)) {
+            videoIntent_[id] = "cancel";
+            p->kill();  // finishVideo writes the Failed/"Cancelled" status
+        } else {
+            row->rec.status = DownloadStatus::Failed;
+            row->rec.error = "Cancelled";
+            db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
+            emit rowChanged(id);
+        }
+        return;
+    }
     if (row->engineId != 0) {
         engine_->cancel(row->engineId);
         row->engineId = 0;
@@ -403,6 +675,11 @@ void DownloadManager::remove(qint64 id, bool alsoRemoveFile) {
     if (row->engineId != 0) {
         engine_->cancel(row->engineId);
         row->engineId = 0;
+    }
+    if (auto* p = videoProcs_.value(id, nullptr)) {
+        // Suppress terminal status writes; finishVideo will find the row gone.
+        videoIntent_[id] = "cancel";
+        p->kill();
     }
     const QString filePath = row->rec.outputPath;
     db_->deleteDownload(id);

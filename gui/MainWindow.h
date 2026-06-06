@@ -73,6 +73,7 @@ private slots:
     void onRowDoubleClicked(const QModelIndex& index);
     void onTableContextMenu(const QPoint& pos);
     void onDownloadCompleted(qint64 id);
+    void onUpdateYtDlp();
 
 private:
     void buildUi();

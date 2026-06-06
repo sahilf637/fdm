@@ -64,6 +64,11 @@ struct DownloadRecord {
     // raw "Name: value" lines (e.g. cookies/referer forwarded from a browser).
     // Empty for downloads started by typing a URL into the dialog.
     QString requestHeaders;
+    // Download kind: "http" (engine-driven, the default) or "video" (a yt-dlp
+    // child process for streaming sites). videoSelector is the yt-dlp -f
+    // selector, persisted so a video download survives pause/restart.
+    QString kind;            // empty is treated as "http"
+    QString videoSelector;
 };
 
 struct ChunkRecord {
@@ -99,6 +104,10 @@ public:
 
     // Persists post-probe metadata (total size and range support).
     void updateDownloadTotals(qint64 id, qint64 totalBytes, bool supportsRanges);
+
+    // Updates the saved output path. Video downloads only learn their final
+    // filename/extension once yt-dlp has muxed the file.
+    void updateDownloadOutputPath(qint64 id, const QString& outputPath);
 
     // Removes the row and (via ON DELETE CASCADE) all its chunks.
     void deleteDownload(qint64 id);

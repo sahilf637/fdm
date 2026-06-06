@@ -124,8 +124,158 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-chrome.contextMenus.onClicked.addListener((info) => {
+async function videoDownload(target, referrer) {
+  if (!isHttp(target)) return;
+  const resp = await sendToFdm({
+    type: "download-video",
+    url: target,
+    selector: "",
+    title: "",
+    headers: videoHeaders(referrer),
+  });
+  if (!resp || !resp.ok) notify("Couldn't start the FDM video download.");
+}
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  // Right-clicking a <video>/<audio> element: its src is usually a blob/MSE URL
+  // that can't be fetched directly, so route it through the video path (yt-dlp)
+  // against the media URL if it's a real one, else the page itself.
+  if (info.mediaType === "video" || info.mediaType === "audio") {
+    const target = isHttp(info.srcUrl)
+      ? info.srcUrl
+      : info.pageUrl || (tab && tab.url);
+    if (isHttp(target)) {
+      videoDownload(target, info.pageUrl);
+      return;
+    }
+  }
   const url = info.linkUrl || info.srcUrl;
   if (!isHttp(url)) return;
   captureUrl(url, { referrer: info.pageUrl });
+});
+
+// --- video detection -------------------------------------------------------
+// Watch network traffic for streaming media (HLS/DASH manifests, progressive
+// audio/video) and keep a per-tab registry. The content script shows a
+// "Download video" badge when a tab has any; picking a quality routes back here
+// to probe (yt-dlp via the host) and, later, to download.
+//
+// The service worker is ephemeral, so the registry is mirrored into
+// chrome.storage.session and rehydrated on startup.
+let tabMedia = {};  // tabId -> { manifest: <url>, count: <int> }
+chrome.storage.session.get({ tabMedia: {} }).then((v) => {
+  tabMedia = v.tabMedia || {};
+});
+function persistMedia() {
+  chrome.storage.session.set({ tabMedia });
+}
+
+// Classify a request as a streaming manifest, plain media, or neither.
+function mediaKind(url, contentType) {
+  const path = url.split(/[?#]/)[0].toLowerCase();
+  const ct = (contentType || "").toLowerCase();
+  if (path.endsWith(".m3u8") || path.endsWith(".mpd") ||
+      ct.includes("mpegurl") || ct.includes("dash+xml")) {
+    return "manifest";
+  }
+  if (/\.(mp4|webm|mkv|mov|m4a|m4s|ts)$/.test(path) ||
+      ct.startsWith("video/") || ct.startsWith("audio/")) {
+    return "media";
+  }
+  return null;
+}
+
+function recordMedia(tabId, url, kind) {
+  const m = tabMedia[tabId] || (tabMedia[tabId] = { manifest: "", count: 0 });
+  if (kind === "manifest") m.manifest = url;  // best probe input when present
+  m.count++;
+  persistMedia();
+  // Nudge the content script to show/refresh its badge (ignored if absent).
+  chrome.tabs
+    .sendMessage(tabId, { fdm: "media-available", manifest: m.manifest })
+    .catch(() => {});
+}
+
+chrome.webRequest.onResponseStarted.addListener(
+  (d) => {
+    if (d.tabId < 0) return;
+    const ctHeader = (d.responseHeaders || []).find(
+      (h) => h.name.toLowerCase() === "content-type",
+    );
+    const kind = mediaKind(d.url, ctHeader && ctHeader.value);
+    if (kind) recordMedia(d.tabId, d.url, kind);
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"],
+);
+
+// A top-level navigation replaces whatever media the tab had.
+chrome.webRequest.onBeforeRequest.addListener(
+  (d) => {
+    if (d.type === "main_frame") {
+      delete tabMedia[d.tabId];
+      persistMedia();
+    }
+  },
+  { urls: ["<all_urls>"], types: ["main_frame"] },
+);
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  delete tabMedia[tabId];
+  persistMedia();
+});
+
+// Pick the best URL to hand yt-dlp: a captured manifest if we saw one
+// (raw HLS/DASH players), otherwise the page URL (YouTube and friends).
+function probeTarget(tab, manifest) {
+  return manifest || (tab && tab.url) || "";
+}
+
+// Video extraction (yt-dlp) deliberately omits cookies: forwarding a logged-in
+// YouTube session forces the web client, which now requires a PO token and
+// returns no downloadable formats ("Requested format is not available"). Public
+// videos work fine without them. (Authenticated video is a future opt-in.)
+function videoHeaders(referrer) {
+  const headers = { "User-Agent": navigator.userAgent };
+  if (referrer) headers["Referer"] = referrer;
+  return headers;
+}
+
+// Bridge messages from the in-page panel (content script) to the native host.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const tabId = sender.tab && sender.tab.id;
+  if (!msg || !msg.fdm) return;
+
+  if (msg.fdm === "get-media") {
+    const m = tabId != null ? tabMedia[tabId] : null;
+    sendResponse({ available: !!(m && m.count), manifest: m ? m.manifest : "" });
+    return;  // synchronous
+  }
+
+  if (msg.fdm === "probe") {
+    (async () => {
+      const url = probeTarget(sender.tab, msg.manifest);
+      if (!isHttp(url)) return sendResponse({ ok: false, error: "no probeable URL" });
+      sendResponse(await sendToFdm({ type: "probe-video", url, headers: videoHeaders() }));
+    })();
+    return true;  // async
+  }
+
+  if (msg.fdm === "download") {
+    (async () => {
+      const pageUrl = (sender.tab && sender.tab.url) || "";
+      const target = probeTarget(sender.tab, msg.manifest);
+      sendResponse(await sendToFdm({
+        type: "download-video",
+        url: target,
+        pageUrl,
+        manifest: msg.manifest || "",
+        formatId: msg.formatId || "",
+        selector: msg.selector || "",
+        title: msg.title || "",
+        headers: videoHeaders(),
+      }));
+    })();
+    return true;  // async
+  }
 });

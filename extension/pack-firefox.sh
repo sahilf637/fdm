@@ -9,7 +9,8 @@ OUT="$SCRIPT_DIR/dist-firefox"
 
 rm -rf "$OUT"
 mkdir -p "$OUT/icons"
-cp "$SCRIPT_DIR/background.js" "$SCRIPT_DIR/popup.html" "$SCRIPT_DIR/popup.js" "$OUT/"
+cp "$SCRIPT_DIR/background.js" "$SCRIPT_DIR/popup.html" "$SCRIPT_DIR/popup.js" \
+   "$SCRIPT_DIR/content.js" "$SCRIPT_DIR/eme-hook.js" "$SCRIPT_DIR/panel.css" "$OUT/"
 cp "$SCRIPT_DIR/icons/"*.png "$OUT/icons/"
 cp "$SCRIPT_DIR/manifest.firefox.json" "$OUT/manifest.json"
 

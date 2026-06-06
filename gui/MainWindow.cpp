@@ -15,6 +15,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QStyle>
 #include <QTableView>
@@ -129,6 +130,10 @@ void MainWindow::buildToolbarAndMenu() {
     dlMenu->addAction(openFolderAction_);
     dlMenu->addSeparator();
     dlMenu->addAction(removeAction_);
+
+    auto* toolsMenu = menuBar()->addMenu("&Tools");
+    auto* updateBackend = toolsMenu->addAction("&Update video downloader (yt-dlp)");
+    connect(updateBackend, &QAction::triggered, this, &MainWindow::onUpdateYtDlp);
 
     auto* toolbar = addToolBar("Main");
     toolbar->setMovable(false);
@@ -306,6 +311,32 @@ void MainWindow::handleIpcMessage(const QByteArray& payload) {
     }
 
     const QJsonObject o = doc.object();
+
+    // Video download from the extension's in-page panel: no dialog -- start it
+    // straight away via yt-dlp under the manager's "video" path.
+    if (o.value("type").toString() == "download-video") {
+        showNormal();
+        raise();
+        activateWindow();
+        const QString url = o.value("url").toString();
+        if (url.isEmpty()) return;
+        QList<QPair<QString, QString>> headers;
+        const QJsonObject h = o.value("headers").toObject();
+        for (auto it = h.begin(); it != h.end(); ++it) {
+            headers.append({it.key(), it.value().toString()});
+        }
+        const QString outDir =
+            QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        const QString title = o.value("title").toString();
+        const qint64 id = manager_->startVideo(url, o.value("selector").toString(),
+                                               title, outDir, headers);
+        statusBar()->showMessage(
+            QString("Downloading video: %1").arg(title.isEmpty() ? url : title), 4000);
+        const int row = model_->rowCount() - 1;
+        if (row >= 0 && model_->idForRow(row) == id) table_->selectRow(row);
+        return;
+    }
+
     ExternalDownloadRequest req;
     req.url = o.value("url").toString();
     req.filename = o.value("filename").toString();
@@ -414,6 +445,15 @@ void MainWindow::onDownloadCompleted(qint64 id) {
     } else if (box.clickedButton() == showFolder) {
         QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(path).absolutePath()));
     }
+}
+
+void MainWindow::onUpdateYtDlp() {
+    statusBar()->showMessage("Updating video downloader…");
+    manager_->updateVideoBackend([this](bool ok, QString msg) {
+        statusBar()->showMessage(ok ? "Video downloader updated" : "Update failed", 5000);
+        QMessageBox::information(this, ok ? "Video downloader" : "Update failed",
+                                 msg.isEmpty() ? (ok ? "Up to date." : "Update failed.") : msg);
+    });
 }
 
 void MainWindow::onTableContextMenu(const QPoint& pos) {

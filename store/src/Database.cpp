@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS downloads (
     hash_source     TEXT,
     actual_hash     TEXT,
     verification    TEXT,
-    request_headers TEXT
+    request_headers TEXT,
+    kind            TEXT NOT NULL DEFAULT 'http',
+    video_selector  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -185,6 +187,8 @@ Database::Database(const QString& dbPath) {
         {"actual_hash",    "actual_hash TEXT"},
         {"verification",   "verification TEXT"},
         {"request_headers", "request_headers TEXT"},
+        {"kind",           "kind TEXT NOT NULL DEFAULT 'http'"},
+        {"video_selector", "video_selector TEXT"},
     };
     for (const Col& c : required) {
         if (existing.contains(c.name)) continue;
@@ -207,8 +211,9 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     q.prepare(
         "INSERT INTO downloads"
         " (url, output_path, total_bytes, supports_ranges, status, error, created_at, updated_at,"
-        "  expected_hash, hash_algorithm, hash_source, actual_hash, verification, request_headers)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "  expected_hash, hash_algorithm, hash_source, actual_hash, verification, request_headers,"
+        "  kind, video_selector)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const qint64 now = nowSeconds();
     q.addBindValue(rec.url);
     q.addBindValue(rec.outputPath);
@@ -225,6 +230,8 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     const QString verStr = verificationStatusToString(rec.verification);
     q.addBindValue(verStr.isEmpty() ? QVariant() : QVariant(verStr));
     q.addBindValue(rec.requestHeaders.isEmpty() ? QVariant() : QVariant(rec.requestHeaders));
+    q.addBindValue(rec.kind.isEmpty() ? QStringLiteral("http") : rec.kind);
+    q.addBindValue(rec.videoSelector.isEmpty() ? QVariant() : QVariant(rec.videoSelector));
     exec(q, "insertDownload");
     return q.lastInsertId().toLongLong();
 }
@@ -290,6 +297,16 @@ void Database::updateDownloadTotals(qint64 id, qint64 totalBytes, bool supportsR
     q.addBindValue(static_cast<qlonglong>(nowSeconds()));
     q.addBindValue(static_cast<qlonglong>(id));
     exec(q, "updateDownloadTotals");
+}
+
+void Database::updateDownloadOutputPath(qint64 id, const QString& outputPath) {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    q.prepare("UPDATE downloads SET output_path = ?, updated_at = ? WHERE id = ?");
+    q.addBindValue(outputPath);
+    q.addBindValue(static_cast<qlonglong>(nowSeconds()));
+    q.addBindValue(static_cast<qlonglong>(id));
+    exec(q, "updateDownloadOutputPath");
 }
 
 void Database::deleteDownload(qint64 id) {
@@ -364,7 +381,7 @@ namespace {
 constexpr const char* kDownloadSelectColumns =
     "id, url, output_path, total_bytes, supports_ranges, status, error,"
     " created_at, updated_at, expected_hash, hash_algorithm, hash_source,"
-    " actual_hash, verification, request_headers";
+    " actual_hash, verification, request_headers, kind, video_selector";
 
 DownloadRecord readDownloadRow(const QSqlQuery& q) {
     DownloadRecord r;
@@ -383,6 +400,8 @@ DownloadRecord readDownloadRow(const QSqlQuery& q) {
     r.actualHash = q.value(12).toString();
     r.verification = verificationStatusFromString(q.value(13).toString());
     r.requestHeaders = q.value(14).toString();
+    r.kind = q.value(15).toString();
+    r.videoSelector = q.value(16).toString();
     return r;
 }
 

@@ -15,6 +15,8 @@
 #include "fdm/EngineEvent.h"
 #include "fdm/store/Database.h"
 
+class QProcess;
+
 namespace fdm::store {
 
 // Qt-flavoured view of fdm::ProbeResult. Strings are QStrings so UI code
@@ -79,6 +81,16 @@ public:
                     const QString& userHash, const QString& userHashAlgorithm,
                     const QList<QPair<QString, QString>>& headers);
 
+    // Start a streaming-media download via yt-dlp (handles HLS/DASH/YouTube and
+    // muxes audio+video with ffmpeg). `selector` is a yt-dlp -f expression;
+    // `title` seeds the output filename under `outputDir`. Headers (cookies/UA)
+    // are forwarded to yt-dlp. Returns the new row id (0 only if a row couldn't
+    // be created). The row is marked kind="video" so pause/resume/cancel route
+    // to the child-process path.
+    qint64 startVideo(const QString& url, const QString& selector,
+                      const QString& title, const QString& outputDir,
+                      const QList<QPair<QString, QString>>& headers);
+
     // Probe a URL without registering a download. Callback fires on the UI
     // thread (the same thread `this` lives on). Useful for filling in a
     // server-suggested filename before the user commits to a save path.
@@ -87,6 +99,11 @@ public:
     // resolves its Content-Disposition filename / size at probe time.
     void probe(const QString& url, const QList<QPair<QString, QString>>& headers,
                std::function<void(ProbeResult)> onResult);
+
+    // Update the video backend in place (runs `yt-dlp -U`). `done` fires with
+    // success + the tool's combined output. Keeps YouTube extraction working as
+    // the site changes. No-op-safe if yt-dlp isn't found.
+    void updateVideoBackend(std::function<void(bool, QString)> done);
 
     // Engine-control operations. All are id-addressed and idempotent: e.g.
     // pause() of an already-paused download is a no-op.
@@ -121,6 +138,11 @@ private:
     void startHashJob(qint64 id);
     void onHashJobDone(qint64 id, const QString& actualHash);
 
+    // --- video (yt-dlp child process) path ----------------------------------
+    void spawnVideo(qint64 id);                       // (re)launch the child
+    void onVideoLine(qint64 id, const QString& line); // parse one output line
+    void finishVideo(qint64 id, bool ok, const QString& error);
+
     Database* db_;
     std::unique_ptr<fdm::DownloadEngine> engine_;
 
@@ -132,6 +154,14 @@ private:
     // Last wall-clock time (ms since epoch) we wrote chunk progress for a
     // download. Throttles DB writes to avoid hammering SQLite at 10 Hz.
     QHash<qint64, qint64> lastPersistMs_;
+
+    // Running yt-dlp child processes, keyed by download id. videoIntent_ records
+    // why we're about to stop one ("cancel"/"pause") so the finished handler
+    // writes the right terminal status; videoFinalPath_ holds the muxed file's
+    // real path once yt-dlp reports it.
+    QHash<qint64, QProcess*> videoProcs_;
+    QHash<qint64, QString> videoIntent_;
+    QHash<qint64, QString> videoFinalPath_;
 };
 
 }  // namespace fdm::store
