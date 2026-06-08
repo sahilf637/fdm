@@ -21,6 +21,7 @@
 #include <variant>
 
 #include "SidecarFetcher.h"
+#include "fdm/Paths.h"
 
 namespace fdm::store {
 
@@ -292,7 +293,7 @@ qint64 DownloadManager::startVideo(const QString& url, const QString& selector,
     rowOrder_.append(id);
     emit rowAdded(id);
 
-    spawnVideo(id);
+    resolveVideo(id);  // -> engine streams (single-file) or yt-dlp child (segmented)
     return id;
 }
 
@@ -310,14 +311,15 @@ void DownloadManager::spawnVideo(qint64 id) {
     const QString dir = out.absolutePath();
 
     QStringList args;
+    // NB: no --print here. --print puts yt-dlp in quiet mode, which suppresses
+    // --progress-template, so we'd parse no progress. Instead we read progress
+    // from the template and the final path from yt-dlp's normal log lines.
     args << "-f" << row->rec.videoSelector << "--no-playlist" << "--newline"
          << "--no-mtime" << "--no-simulate" << "--no-warnings"
          << "--merge-output-format" << "mp4" << "--progress-template"
          << "FDMPROG|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
             "%(progress.total_bytes_estimate)s|%(progress.speed)s"
-         << "--print" << "after_move:filepath"
          // Name by the video's real title (finishVideo adopts the actual path).
-         // The provisional row name still shows whatever title we were given.
          << "-o" << QDir(dir).filePath("%(title)s.%(ext)s");
     const QString ffmpeg = findHelper("ffmpeg");
     if (!ffmpeg.isEmpty()) args << "--ffmpeg-location" << ffmpeg;
@@ -394,11 +396,19 @@ void DownloadManager::onVideoLine(qint64 id, const QString& line) {
         return;
     }
 
-    // yt-dlp's `after_move:filepath` print: the finished file's absolute path.
-    if (line.startsWith('/') &&
-        QFileInfo(line).absolutePath() == QFileInfo(row->rec.outputPath).absolutePath()) {
-        videoFinalPath_[id] = line;
+    // Track the output path from yt-dlp's own log. For merged audio+video the
+    // authoritative line is `[Merger] Merging formats into "X"` (emitted last);
+    // for a single stream it's `[download] Destination: X`. Last write wins,
+    // which lands on the merge target when merging and the lone file otherwise.
+    const QString kMerge = QStringLiteral("Merging formats into \"");
+    if (const int mi = line.indexOf(kMerge); mi >= 0) {
+        const int start = mi + kMerge.size();
+        const int end = line.lastIndexOf('"');
+        if (end > start) videoFinalPath_[id] = line.mid(start, end - start);
+        return;
     }
+    const QString kDest = QStringLiteral("[download] Destination: ");
+    if (line.startsWith(kDest)) videoFinalPath_[id] = line.mid(kDest.size());
 }
 
 void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
@@ -435,8 +445,12 @@ void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
             row->rec.outputPath = fp;
             db_->updateDownloadOutputPath(id, fp);
         }
-        if (row->rec.totalBytes <= 0 && row->bytesReceived > 0) {
-            row->rec.totalBytes = row->bytesReceived;
+        // Per-stream progress resets between video and audio, so use the real
+        // muxed file size as the authoritative final byte count.
+        const qint64 sz = QFileInfo(row->rec.outputPath).size();
+        if (sz > 0) {
+            row->bytesReceived = sz;
+            row->rec.totalBytes = sz;
         } else if (row->rec.totalBytes > 0) {
             row->bytesReceived = row->rec.totalBytes;
         }
@@ -451,6 +465,314 @@ void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
         row->rec.error = error.isEmpty() ? QStringLiteral("video download failed") : error;
         db_->updateDownloadStatus(id, DownloadStatus::Failed, row->rec.error);
         videoFinalPath_.remove(id);
+        emit rowChanged(id);
+    }
+}
+
+// One engine-driven video download: 1-2 single-file streams fetched in parallel
+// by the multi-connection engine, then muxed with ffmpeg.
+struct DownloadManager::VideoEngineJob {
+    QString finalPath;
+    struct Stream {
+        QString url;
+        std::vector<std::string> headers;
+        QString tempPath;
+        fdm::DownloadId engineId = 0;
+        qint64 received = 0;
+        qint64 total = -1;
+        double rate = 0.0;
+        bool done = false;
+        QList<ChunkRecord> chunks;  // live segment layout from the engine
+    };
+    QList<Stream> streams;
+    QProcess* ffmpeg = nullptr;
+    bool finishing = false;
+};
+
+void DownloadManager::resolveVideo(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+    const QString ytdlp = findHelper("yt-dlp");
+    if (ytdlp.isEmpty()) {
+        finishEngineVideo(id, false, "yt-dlp not found");
+        return;
+    }
+    QStringList args;
+    args << "-f" << row->rec.videoSelector << "-J" << "--no-playlist" << "--no-warnings";
+    for (const std::string& h : headersFromJson(row->rec.requestHeaders)) {
+        const QString line = QString::fromStdString(h);
+        const int sep = line.indexOf(": ");
+        if (sep > 0 && line.left(sep).compare("User-Agent", Qt::CaseInsensitive) == 0)
+            args << "--user-agent" << line.mid(sep + 2);  // cookies skipped (see spawnVideo)
+    }
+    args << "--" << row->rec.url;
+
+    auto* proc = new QProcess(this);
+    proc->setProcessChannelMode(QProcess::SeparateChannels);  // JSON on stdout
+    connect(proc, &QProcess::finished, this,
+            [this, id, proc](int code, QProcess::ExitStatus st) {
+                const QByteArray out = proc->readAllStandardOutput();
+                const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+                proc->deleteLater();
+                DownloadLiveRow* r = find(id);
+                if (!r || r->rec.status != DownloadStatus::Active) return;  // cancelled/removed
+                if (st != QProcess::NormalExit || code != 0) {
+                    finishEngineVideo(id, false,
+                                      err.isEmpty() ? QStringLiteral("could not read video")
+                                                    : err.left(300));
+                    return;
+                }
+                handleResolved(id, out);
+            });
+    proc->start(ytdlp, args);
+}
+
+void DownloadManager::handleResolved(qint64 id, const QByteArray& jsonOut) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+    const QJsonDocument doc = QJsonDocument::fromJson(jsonOut);
+    if (!doc.isObject()) {
+        spawnVideo(id);
+        return;
+    }
+    const QJsonObject info = doc.object();
+
+    QList<QJsonObject> streams;
+    const QJsonArray rf = info.value("requested_formats").toArray();
+    if (!rf.isEmpty()) {
+        for (const QJsonValue& v : rf) streams.append(v.toObject());
+    } else if (!info.value("url").toString().isEmpty()) {
+        streams.append(info);
+    }
+
+    // Engine path only for 1-2 plain http(s) single-file streams. Anything
+    // segmented (m3u8/dash) or odd falls back to yt-dlp's own downloader.
+    bool engineOk = !streams.isEmpty() && streams.size() <= 2;
+    for (const QJsonObject& s : streams) {
+        const QString proto = s.value("protocol").toString();
+        if ((proto != "https" && proto != "http") || s.value("url").toString().isEmpty())
+            engineOk = false;
+    }
+    if (!engineOk) {
+        spawnVideo(id);
+        return;
+    }
+
+    const QString dir = QFileInfo(row->rec.outputPath).absolutePath();
+    // Prefer the name the user picked in the save dialog (the row's current base
+    // name); fall back to the video's own title for the no-name right-click
+    // path. The extension follows yt-dlp's container choice so `ffmpeg -c copy`
+    // always succeeds (mp4 when compatible, mkv otherwise).
+    QString leaf = QFileInfo(row->rec.outputPath).completeBaseName();
+    if (leaf.isEmpty() || leaf == "video") leaf = sanitizeLeaf(info.value("title").toString());
+    QString ext = info.value("ext").toString();
+    if (ext.isEmpty()) ext = QStringLiteral("mp4");
+
+    auto* job = new VideoEngineJob();
+    job->finalPath = QString::fromStdString(
+        fdm::findAvailablePath(QDir(dir).filePath(leaf + "." + ext).toStdString()));
+    for (int i = 0; i < streams.size(); ++i) {
+        VideoEngineJob::Stream st;
+        st.url = streams[i].value("url").toString();
+        const QJsonObject h = streams[i].value("http_headers").toObject();
+        for (auto it = h.begin(); it != h.end(); ++it)
+            st.headers.push_back((it.key() + ": " + it.value().toString()).toStdString());
+        st.tempPath = QDir(dir).filePath(QStringLiteral(".fdm-%1.s%2.part").arg(id).arg(i));
+        double sz = streams[i].value("filesize").toDouble();
+        if (sz <= 0) sz = streams[i].value("filesize_approx").toDouble();
+        st.total = sz > 0 ? static_cast<qint64>(sz) : -1;
+        job->streams.append(st);
+    }
+    videoJobs_.insert(id, job);
+
+    row->rec.outputPath = job->finalPath;
+    db_->updateDownloadOutputPath(id, job->finalPath);
+    qint64 tot = 0;
+    bool allKnown = true;
+    for (const auto& s : job->streams) {
+        if (s.total > 0) tot += s.total;
+        else allKnown = false;
+    }
+    if (allKnown) {
+        row->rec.totalBytes = tot;
+        db_->updateDownloadTotals(id, tot, true);
+    }
+    emit rowChanged(id);
+    startEngineStreams(id);
+}
+
+void DownloadManager::startEngineStreams(qint64 id) {
+    VideoEngineJob* job = videoJobs_.value(id, nullptr);
+    if (!job) return;
+    for (int i = 0; i < job->streams.size(); ++i) {
+        VideoEngineJob::Stream& st = job->streams[i];
+        st.engineId = engine_->start(
+            st.url.toStdString(), st.tempPath.toStdString(), st.headers,
+            [this, id, i](fdm::EngineEvent ev) {
+                QMetaObject::invokeMethod(
+                    this, [this, id, i, ev = std::move(ev)]() mutable {
+                        onVideoStreamEvent(id, i, std::move(ev));
+                    },
+                    Qt::QueuedConnection);
+            });
+    }
+}
+
+void DownloadManager::onVideoStreamEvent(qint64 id, int streamIdx, fdm::EngineEvent ev) {
+    VideoEngineJob* job = videoJobs_.value(id, nullptr);
+    if (!job || streamIdx >= job->streams.size()) return;
+    VideoEngineJob::Stream& st = job->streams[streamIdx];
+    std::visit(
+        [&](auto&& e) {
+            using T = std::decay_t<decltype(e)>;
+            if constexpr (std::is_same_v<T, fdm::Started>) {
+                if (e.contentLength > 0) st.total = e.contentLength;
+            } else if constexpr (std::is_same_v<T, fdm::Progress>) {
+                st.received = e.received;
+                if (e.total > 0) st.total = e.total;
+                st.rate = e.bytesPerSec;
+                st.chunks = chunksFromProgress(e.chunks);
+                updateVideoJobProgress(id);
+            } else if constexpr (std::is_same_v<T, fdm::Finished>) {
+                st.done = true;
+                st.engineId = 0;
+                if (st.total > 0) st.received = st.total;
+                st.rate = 0;
+                for (ChunkRecord& c : st.chunks) c.status = ChunkPersistStatus::Done;
+                updateVideoJobProgress(id);
+                bool all = true;
+                for (const auto& s : job->streams) if (!s.done) all = false;
+                if (all) beginVideoMux(id);
+            } else if constexpr (std::is_same_v<T, fdm::Failed>) {
+                st.engineId = 0;
+                finishEngineVideo(id, false, QString::fromStdString(e.reason));
+            }
+            // Paused: the engine-video path doesn't drive engine pause; ignored.
+        },
+        ev);
+}
+
+void DownloadManager::updateVideoJobProgress(qint64 id) {
+    VideoEngineJob* job = videoJobs_.value(id, nullptr);
+    DownloadLiveRow* row = find(id);
+    if (!job || !row) return;
+    qint64 rcv = 0, tot = 0;
+    double rate = 0;
+    bool allKnown = true;
+    for (const auto& s : job->streams) {
+        rcv += s.received;
+        rate += s.rate;
+        if (s.total > 0) tot += s.total;
+        else allKnown = false;
+    }
+    row->bytesReceived = rcv;
+    if (allKnown) row->rec.totalBytes = tot;
+    row->bytesPerSec = rate;
+    // Surface each stream's segments in the details view, re-indexed across
+    // streams so the (video, then audio) chunks read as one contiguous list.
+    QList<ChunkRecord> all;
+    int idx = 0;
+    for (const auto& s : job->streams)
+        for (ChunkRecord c : s.chunks) { c.index = idx++; all.append(c); }
+    row->chunks = all;
+    emit rowChanged(id);
+}
+
+void DownloadManager::beginVideoMux(qint64 id) {
+    VideoEngineJob* job = videoJobs_.value(id, nullptr);
+    DownloadLiveRow* row = find(id);
+    if (!job || !row || job->finishing) return;
+    job->finishing = true;
+    row->bytesPerSec = 0;
+    emit rowChanged(id);
+
+    // Single stream (progressive / audio-only): no mux, just move into place.
+    if (job->streams.size() == 1) {
+        QFile::remove(job->finalPath);
+        const bool moved = QFile::rename(job->streams[0].tempPath, job->finalPath);
+        finishEngineVideo(id, moved, moved ? QString() : QStringLiteral("could not move file"));
+        return;
+    }
+
+    const QString ffmpeg = findHelper("ffmpeg");
+    if (ffmpeg.isEmpty()) {
+        finishEngineVideo(id, false, "ffmpeg not found");
+        return;
+    }
+    QStringList args;
+    for (const auto& s : job->streams) args << "-i" << s.tempPath;
+    args << "-c" << "copy" << "-y" << job->finalPath;
+
+    auto* mux = new QProcess(this);
+    mux->setProcessChannelMode(QProcess::MergedChannels);
+    job->ffmpeg = mux;
+    auto fired = std::make_shared<bool>(false);
+    connect(mux, &QProcess::finished, this,
+            [this, id, mux, fired](int code, QProcess::ExitStatus stt) {
+                if (*fired) return;
+                *fired = true;
+                const bool ok = stt == QProcess::NormalExit && code == 0;
+                const QString err = ok ? QString() : QString::fromUtf8(mux->readAll()).right(300);
+                finishEngineVideo(id, ok, ok ? QString() : ("mux failed: " + err));
+            });
+    connect(mux, &QProcess::errorOccurred, this, [this, id, fired](QProcess::ProcessError) {
+        if (*fired) return;
+        *fired = true;
+        finishEngineVideo(id, false, "ffmpeg failed to run");
+    });
+    mux->start(ffmpeg, args);
+}
+
+void DownloadManager::finishEngineVideo(qint64 id, bool ok, const QString& error) {
+    QString finalPath;
+    if (VideoEngineJob* job = videoJobs_.value(id, nullptr)) {
+        for (auto& s : job->streams)
+            if (s.engineId) { engine_->cancel(s.engineId); s.engineId = 0; }
+        for (const auto& s : job->streams) QFile::remove(s.tempPath);
+        finalPath = job->finalPath;
+        if (job->ffmpeg) job->ffmpeg->deleteLater();
+        videoJobs_.remove(id);
+        delete job;
+    }
+    DownloadLiveRow* row = find(id);
+    if (!row) {
+        videoIntent_.remove(id);
+        return;
+    }
+    row->bytesPerSec = 0;
+    const QString intent = videoIntent_.take(id);
+    if (intent == "cancel") {
+        if (!finalPath.isEmpty()) QFile::remove(finalPath);
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.error = "Cancelled";
+        db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
+        emit rowChanged(id);
+        return;
+    }
+    if (intent == "pause") {
+        row->rec.status = DownloadStatus::Paused;
+        db_->updateDownloadStatus(id, DownloadStatus::Paused);
+        emit rowChanged(id);
+        return;
+    }
+    if (ok) {
+        const QString path = finalPath.isEmpty() ? row->rec.outputPath : finalPath;
+        const qint64 sz = QFileInfo(path).size();
+        if (sz > 0) {
+            row->bytesReceived = sz;
+            row->rec.totalBytes = sz;
+            db_->updateDownloadTotals(id, sz, true);
+        }
+        row->rec.status = DownloadStatus::Completed;
+        row->rec.verification = VerificationStatus::Unverified;
+        db_->updateDownloadStatus(id, DownloadStatus::Completed);
+        db_->updateVerificationStatus(id, VerificationStatus::Unverified);
+        emit rowChanged(id);
+    } else {
+        if (!finalPath.isEmpty()) QFile::remove(finalPath);
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.error = error.isEmpty() ? QStringLiteral("video download failed") : error;
+        db_->updateDownloadStatus(id, DownloadStatus::Failed, row->rec.error);
         emit rowChanged(id);
     }
 }
@@ -530,10 +852,10 @@ void DownloadManager::pause(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
     if (row->rec.kind == "video") {
-        if (auto* p = videoProcs_.value(id, nullptr)) {
-            videoIntent_[id] = "pause";
-            p->terminate();  // yt-dlp leaves a .part; resume continues it
-        }
+        videoIntent_[id] = "pause";
+        if (videoJobs_.contains(id)) { finishEngineVideo(id, false, "paused"); return; }
+        if (auto* p = videoProcs_.value(id, nullptr)) p->terminate();  // yt-dlp leaves .part
+        else videoIntent_.remove(id);  // nothing running to pause
         return;
     }
     if (row->engineId == 0) {
@@ -553,7 +875,12 @@ void DownloadManager::resume(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
     if (row->rec.kind == "video") {
-        if (!videoProcs_.contains(id)) spawnVideo(id);  // re-run; continues .part
+        if (videoProcs_.contains(id) || videoJobs_.contains(id)) return;  // already running
+        row->rec.status = DownloadStatus::Active;
+        row->rec.error.clear();
+        db_->updateDownloadStatus(id, DownloadStatus::Active);
+        emit rowChanged(id);
+        resolveVideo(id);  // URLs expire, so re-resolve and restart
         return;
     }
     if (row->engineId != 0) {
@@ -605,10 +932,13 @@ void DownloadManager::retry(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
     if (row->rec.kind == "video") {
-        if (videoProcs_.contains(id)) return;
+        if (videoProcs_.contains(id) || videoJobs_.contains(id)) return;
         row->bytesReceived = 0;
         row->rec.error.clear();
-        spawnVideo(id);
+        row->rec.status = DownloadStatus::Active;
+        db_->updateDownloadStatus(id, DownloadStatus::Active);
+        emit rowChanged(id);
+        resolveVideo(id);
         return;
     }
     if (row->engineId != 0) {
@@ -648,15 +978,14 @@ void DownloadManager::cancel(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
     if (row->rec.kind == "video") {
-        if (auto* p = videoProcs_.value(id, nullptr)) {
-            videoIntent_[id] = "cancel";
-            p->kill();  // finishVideo writes the Failed/"Cancelled" status
-        } else {
-            row->rec.status = DownloadStatus::Failed;
-            row->rec.error = "Cancelled";
-            db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
-            emit rowChanged(id);
-        }
+        videoIntent_[id] = "cancel";
+        if (videoJobs_.contains(id)) { finishEngineVideo(id, false, "Cancelled"); return; }
+        if (auto* p = videoProcs_.value(id, nullptr)) { p->kill(); return; }
+        // resolve in flight, or nothing running -> mark failed directly.
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.error = "Cancelled";
+        db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
+        emit rowChanged(id);
         return;
     }
     if (row->engineId != 0) {
@@ -676,11 +1005,17 @@ void DownloadManager::remove(qint64 id, bool alsoRemoveFile) {
         engine_->cancel(row->engineId);
         row->engineId = 0;
     }
-    if (auto* p = videoProcs_.value(id, nullptr)) {
-        // Suppress terminal status writes; finishVideo will find the row gone.
-        videoIntent_[id] = "cancel";
-        p->kill();
+    // Tear down any in-flight video work (yt-dlp child or engine streams);
+    // their async handlers will find the row gone and just clean up.
+    if (auto* p = videoProcs_.value(id, nullptr)) p->kill();
+    if (VideoEngineJob* job = videoJobs_.take(id)) {
+        for (auto& s : job->streams) if (s.engineId) engine_->cancel(s.engineId);
+        for (const auto& s : job->streams) QFile::remove(s.tempPath);
+        if (job->ffmpeg) job->ffmpeg->deleteLater();
+        delete job;
     }
+    videoIntent_.remove(id);
+    videoFinalPath_.remove(id);
     const QString filePath = row->rec.outputPath;
     db_->deleteDownload(id);
     rows_.remove(id);

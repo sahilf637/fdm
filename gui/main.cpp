@@ -5,6 +5,7 @@
 #include <QMessageBox>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QSystemTrayIcon>
 #include <QTimer>
 #include <curl/curl.h>
 
@@ -93,9 +94,26 @@ int main(int argc, char* argv[]) {
     QObject::connect(&instance, &fdm_gui::SingleInstance::messageReceived, &w,
                      &fdm_gui::MainWindow::handleIpcMessage, Qt::QueuedConnection);
 
-    w.show();
+    // System-tray model: when a tray is available the app lives in the
+    // background instead of quitting when its last window closes. This lets a
+    // browser-triggered download run in its own dialog + details window without
+    // forcing the main list to the foreground, and keeps active downloads alive
+    // even after their details window is closed.
+    const bool trayOk = QSystemTrayIcon::isSystemTrayAvailable();
+    if (trayOk) {
+        app.setQuitOnLastWindowClosed(false);
+        w.installTray();
+    }
 
-    // If we were launched with a request, handle it once the window is up.
+    // Show the main list only on a plain launch (the user opened the app) or
+    // when there's no tray to keep us alive. A launch that exists solely to
+    // service a browser download stays headless -- it goes straight to the
+    // download dialog + details window.
+    if (launchPayload.isEmpty() || !trayOk) {
+        w.show();
+    }
+
+    // If we were launched with a request, handle it once the event loop runs.
     if (!launchPayload.isEmpty()) {
         QTimer::singleShot(0, &w, [&w, launchPayload]() {
             w.handleIpcMessage(launchPayload);

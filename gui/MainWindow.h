@@ -10,6 +10,7 @@
 
 class QAction;
 class QItemSelection;
+class QSystemTrayIcon;
 class QTableView;
 
 namespace fdm::store {
@@ -53,6 +54,11 @@ public:
     // Download dialog pre-filled (forwarding auth headers on start).
     void openExternalDownload(const ExternalDownloadRequest& req);
 
+    // Install a system-tray icon so the app can live in the background with the
+    // main list hidden (downloads keep running). Tray menu: open the list /
+    // quit. Called once at startup, only when a tray is available.
+    void installTray();
+
 public slots:
     // Entry point for IPC payloads (from SingleInstance). An empty/!object
     // payload just raises the window; otherwise it is parsed into an
@@ -85,6 +91,7 @@ private:
     fdm::store::DownloadManager* manager_;
     fdm::store::DownloadListModel* model_ = nullptr;
     QTableView* table_ = nullptr;
+    QSystemTrayIcon* tray_ = nullptr;
 
     QAction* newAction_ = nullptr;
     QAction* pauseAction_ = nullptr;

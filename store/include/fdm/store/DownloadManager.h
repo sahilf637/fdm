@@ -138,10 +138,23 @@ private:
     void startHashJob(qint64 id);
     void onHashJobDone(qint64 id, const QString& actualHash);
 
-    // --- video (yt-dlp child process) path ----------------------------------
+    // --- video (yt-dlp child process) path, used for segmented HLS/DASH ------
     void spawnVideo(qint64 id);                       // (re)launch the child
     void onVideoLine(qint64 id, const QString& line); // parse one output line
     void finishVideo(qint64 id, bool ok, const QString& error);
+
+    // --- video via the multi-connection engine + ffmpeg mux ------------------
+    // resolveVideo runs `yt-dlp -J` to get the direct stream URL(s); single-file
+    // (https) streams are downloaded by the engine in parallel and muxed with
+    // ffmpeg, while segmented streams fall back to the yt-dlp child above.
+    struct VideoEngineJob;
+    void resolveVideo(qint64 id);
+    void handleResolved(qint64 id, const QByteArray& jsonOut);
+    void startEngineStreams(qint64 id);
+    void onVideoStreamEvent(qint64 id, int streamIdx, fdm::EngineEvent ev);
+    void updateVideoJobProgress(qint64 id);
+    void beginVideoMux(qint64 id);
+    void finishEngineVideo(qint64 id, bool ok, const QString& error);
 
     Database* db_;
     std::unique_ptr<fdm::DownloadEngine> engine_;
@@ -162,6 +175,7 @@ private:
     QHash<qint64, QProcess*> videoProcs_;
     QHash<qint64, QString> videoIntent_;
     QHash<qint64, QString> videoFinalPath_;
+    QHash<qint64, VideoEngineJob*> videoJobs_;  // engine-driven video downloads
 };
 
 }  // namespace fdm::store

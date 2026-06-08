@@ -84,11 +84,17 @@ video+audio mux; audio-only option), a DRM page (refused), and an age-gated CC v
 - Licensing: yt-dlp is Unlicense; use an **LGPL** ffmpeg build to bundle cleanly.
 - DRM stays excluded by design (legal + technical).
 
-## Implementation note (v1 transfer path)
-v1 downloads video via a **yt-dlp child process** for *all* cases (progressive,
-HLS, DASH, YouTube merge) — uniform, robust, and fully additive (the engine
-download path and its tests are untouched). Rows are marked `kind='video'` in the
-DB so pause/resume/cancel/retry/restart route to the yt-dlp path. ffmpeg does the
-mux. **Deferred optimization (honours Q2 fully):** route single-file, range-
-supported streams through the multi-connection engine instead of yt-dlp's
-downloader. Tracked as a follow-up; not a feature gap.
+## Transfer path (implemented)
+Video downloads are `kind='video'` rows. `startVideo` → `resolveVideo` runs
+`yt-dlp -J` to get the chosen stream URL(s) + headers, then:
+- **Single-file https streams** (YouTube adaptive video/audio, progressive) →
+  the **multi-connection engine** downloads each stream in parallel to a temp
+  file, then **ffmpeg `-c copy`** muxes them. This bypasses YouTube's per-
+  connection throttling. (`requested_formats` → `VideoEngineJob`.)
+- **Segmented HLS/DASH** (protocol m3u8/dash) → fall back to the **yt-dlp child
+  process** (`spawnVideo`), which fragments+muxes itself.
+
+Cookies are NOT forwarded (a logged-in YouTube session forces the PO-token-gated
+web client → no formats). Container/ext follows yt-dlp's choice (mp4 or mkv).
+pause/cancel tear down engine streams + ffmpeg; resume/retry re-resolve (URLs
+expire) and restart.

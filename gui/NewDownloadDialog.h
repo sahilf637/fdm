@@ -5,6 +5,7 @@
 #include <QPair>
 #include <QString>
 
+class QFormLayout;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -34,6 +35,12 @@ public:
     // existing row). Empty strings leave that field at its default.
     void prefill(const QString& url, const QString& directory,
                  const QString& filename, const QString& expectedHash = QString());
+
+    // Switch to "video" mode for a yt-dlp download: Start skips the HTTP HEAD
+    // probe (the URL is a page/stream URL, not a file) and just resolves
+    // folder + name. The URL becomes read-only and the hash row is hidden
+    // (a muxed video has nothing to verify). Call once, before exec().
+    void setVideoMode();
 
     // Extra request headers (Cookie / Referer / User-Agent) sent on the probe
     // this dialog runs when the user clicks Start. Needed so an authenticated
@@ -65,6 +72,8 @@ private:
     void handleProbeResult(const fdm::store::ProbeResult& result);
 
     fdm::store::DownloadManager* manager_;
+    QFormLayout* form_ = nullptr;
+    bool videoMode_ = false;
     QLineEdit* urlEdit_ = nullptr;
     QLineEdit* dirEdit_ = nullptr;
     QLineEdit* nameEdit_ = nullptr;

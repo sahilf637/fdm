@@ -4,7 +4,6 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QDesktopServices>
-#include <QDir>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QIcon>
@@ -18,6 +17,7 @@
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QStyle>
+#include <QSystemTrayIcon>
 #include <QTableView>
 #include <QToolBar>
 #include <QUrl>
@@ -151,6 +151,36 @@ void MainWindow::buildToolbarAndMenu() {
     toolbar->addAction(removeAction_);
 }
 
+void MainWindow::installTray() {
+    tray_ = new QSystemTrayIcon(windowIcon(), this);
+    tray_->setToolTip("Fresh Download Manager");
+
+    auto* menu = new QMenu(this);
+    auto* openAction = menu->addAction("Open FDM");
+    connect(openAction, &QAction::triggered, this, [this]() {
+        showNormal();
+        raise();
+        activateWindow();
+    });
+    menu->addSeparator();
+    auto* quitAction = menu->addAction("Quit");
+    connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
+    tray_->setContextMenu(menu);
+
+    // Clicking the tray icon reopens the list (closing the window only hides
+    // it; with quitOnLastWindowClosed=false the app keeps running here).
+    connect(tray_, &QSystemTrayIcon::activated, this,
+            [this](QSystemTrayIcon::ActivationReason reason) {
+                if (reason == QSystemTrayIcon::Trigger ||
+                    reason == QSystemTrayIcon::DoubleClick) {
+                    showNormal();
+                    raise();
+                    activateWindow();
+                }
+            });
+    tray_->show();
+}
+
 qint64 MainWindow::currentDownloadId() const {
     const QModelIndexList selection = table_->selectionModel()->selectedRows();
     if (selection.isEmpty()) return 0;
@@ -259,20 +289,20 @@ void MainWindow::redownloadFromRow(qint64 id) {
     if (newRow >= 0 && model_->idForRow(newRow) == newId) {
         table_->selectRow(newRow);
     }
+    // Pop a details window for the restart -- this path also fires from a
+    // details window's "Redownload…" button while the main list is hidden.
+    openDetailsFor(newId);
 }
 
 void MainWindow::openExternalDownload(const ExternalDownloadRequest& req) {
-    // Bring the app to the foreground regardless of whether we end up starting
-    // a download -- the user just clicked something in their browser.
-    showNormal();
-    raise();
-    activateWindow();
-
     if (req.url.isEmpty()) return;
     const QUrl u(req.url);
     if (u.scheme() != "http" && u.scheme() != "https") return;
 
-    NewDownloadDialog dlg(manager_, this);
+    // Stand-alone dialog (parent nullptr): for a browser-triggered download the
+    // main list stays hidden in the tray, so the dialog -- and the details
+    // window it opens on Start -- carry the whole flow on their own.
+    NewDownloadDialog dlg(manager_, nullptr);
     dlg.prefill(req.url, req.dir, req.filename, req.hash);
     // The probe the dialog runs on accept needs the same auth context, or an
     // authenticated URL would 401 at filename-detection time.
@@ -286,10 +316,9 @@ void MainWindow::openExternalDownload(const ExternalDownloadRequest& req) {
                                          dlg.userHashAlgorithm(), req.headers);
     statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()),
                              4000);
-    const int row = model_->rowCount() - 1;
-    if (row >= 0 && model_->idForRow(row) == id) {
-        table_->selectRow(row);
-    }
+    // Show live progress in its own details window rather than the main list.
+    // (This also wires up the completion modal.)
+    openDetailsFor(id);
 }
 
 void MainWindow::handleIpcMessage(const QByteArray& payload) {
@@ -315,9 +344,6 @@ void MainWindow::handleIpcMessage(const QByteArray& payload) {
     // Video download from the extension's in-page panel: no dialog -- start it
     // straight away via yt-dlp under the manager's "video" path.
     if (o.value("type").toString() == "download-video") {
-        showNormal();
-        raise();
-        activateWindow();
         const QString url = o.value("url").toString();
         if (url.isEmpty()) return;
         QList<QPair<QString, QString>> headers;
@@ -325,15 +351,29 @@ void MainWindow::handleIpcMessage(const QByteArray& payload) {
         for (auto it = h.begin(); it != h.end(); ++it) {
             headers.append({it.key(), it.value().toString()});
         }
-        const QString outDir =
+        // Same New Download dialog as a direct download, in "video" mode (no
+        // HTTP probe / hash -- yt-dlp owns extraction). We take the chosen
+        // folder + base name; the real extension (mp4/mkv) is decided once
+        // yt-dlp resolves the container, so the typed one is just a hint.
+        QString suggested = o.value("title").toString();
+        if (suggested.isEmpty()) suggested = QStringLiteral("video");
+        suggested.replace('/', '_').replace('\\', '_');
+        const QString defDir =
             QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
-        const QString title = o.value("title").toString();
-        const qint64 id = manager_->startVideo(url, o.value("selector").toString(),
-                                               title, outDir, headers);
+
+        NewDownloadDialog dlg(manager_, nullptr);
+        dlg.setVideoMode();
+        dlg.prefill(url, defDir, suggested + ".mp4");
+        if (dlg.exec() != QDialog::Accepted) return;
+        const QString out = dlg.outputPath();
+        if (out.isEmpty()) return;
+        const QFileInfo fi(out);
+        const qint64 id =
+            manager_->startVideo(url, o.value("selector").toString(),
+                                 fi.completeBaseName(), fi.absolutePath(), headers);
         statusBar()->showMessage(
-            QString("Downloading video: %1").arg(title.isEmpty() ? url : title), 4000);
-        const int row = model_->rowCount() - 1;
-        if (row >= 0 && model_->idForRow(row) == id) table_->selectRow(row);
+            QString("Downloading video: %1").arg(fi.completeBaseName()), 4000);
+        openDetailsFor(id);
         return;
     }
 

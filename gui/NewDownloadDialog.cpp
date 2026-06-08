@@ -114,11 +114,11 @@ void NewDownloadDialog::buildUi() {
     hashEdit_->setPlaceholderText(
         "SHA-256 / SHA-1 / MD5 hex — algorithm auto-detected from length");
 
-    auto* form = new QFormLayout;
-    form->addRow("URL:", urlEdit_);
-    form->addRow("Save to:", dirRow);
-    form->addRow("Save as:", nameEdit_);
-    form->addRow("Hash (optional):", hashEdit_);
+    form_ = new QFormLayout;
+    form_->addRow("URL:", urlEdit_);
+    form_->addRow("Save to:", dirRow);
+    form_->addRow("Save as:", nameEdit_);
+    form_->addRow("Hash (optional):", hashEdit_);
 
     statusLabel_ = new QLabel;
     statusLabel_->setStyleSheet("color: palette(mid);");
@@ -135,7 +135,7 @@ void NewDownloadDialog::buildUi() {
     btnRow->addWidget(cancelBtn_);
 
     auto* root = new QVBoxLayout(this);
-    root->addLayout(form);
+    root->addLayout(form_);
     root->addLayout(btnRow);
 
     resize(580, sizeHint().height());
@@ -195,10 +195,35 @@ void NewDownloadDialog::handleProbeResult(const ProbeResult& result) {
     finishWithFilename(filename);
 }
 
+void NewDownloadDialog::setVideoMode() {
+    videoMode_ = true;
+    setWindowTitle("Download Video");
+    // The URL is a page/stream URL resolved by yt-dlp (quality was already
+    // chosen in the browser panel), so it isn't editable here; and a muxed
+    // video has no post-download hash to check.
+    urlEdit_->setReadOnly(true);
+    form_->setRowVisible(hashEdit_, false);
+}
+
 void NewDownloadDialog::onAccept() {
     const QString url = urlEdit_->text().trimmed();
     if (url.isEmpty()) {
         QMessageBox::warning(this, "Missing URL", "Please enter a URL.");
+        return;
+    }
+
+    if (videoMode_) {
+        // yt-dlp owns extraction -- no HTTP probe. Resolve the save path from
+        // the chosen folder + name; the real container extension (mp4/mkv) is
+        // decided once yt-dlp resolves the stream, so the typed one is a hint.
+        QString name = nameEdit_->text().trimmed();
+        if (name.isEmpty()) name = QStringLiteral("video");
+        QString dir = dirEdit_->text().trimmed();
+        if (dir.isEmpty()) {
+            dir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        }
+        resolvedPath_ = QDir(dir).filePath(name);
+        accept();
         return;
     }
 
