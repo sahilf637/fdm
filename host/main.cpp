@@ -145,6 +145,23 @@ QString findYtDlp() {
     return QStandardPaths::findExecutable("yt-dlp");
 }
 
+// Pull a byte size from a yt-dlp format/info object: exact filesize, else the
+// estimate, else -1.
+qint64 formatFilesize(const QJsonObject& f) {
+    if (!f.value("filesize").isNull())
+        return static_cast<qint64>(f.value("filesize").toDouble());
+    if (!f.value("filesize_approx").isNull())
+        return static_cast<qint64>(f.value("filesize_approx").toDouble());
+    return -1;
+}
+
+// yt-dlp's protocol string names a segmented transport (HLS/DASH) that the
+// engine's plain-range downloader can't handle.
+bool isSegmentedProtocol(const QString& proto) {
+    return proto.contains(QLatin1String("m3u8")) ||
+           proto.contains(QLatin1String("dash"));
+}
+
 // Short human label for a format, e.g. "1080p60 video-only mp4", "audio m4a".
 QString buildLabel(bool hasVideo, bool hasAudio, int height, double fps,
                    const QString& ext) {
@@ -174,17 +191,12 @@ QJsonArray curateFormats(const QJsonArray& formats) {
         if (!hasVideo && !hasAudio) continue;
 
         const QString proto = f.value("protocol").toString();
-        const bool segmented = proto.contains(QLatin1String("m3u8")) ||
-                               proto.contains(QLatin1String("dash"));
+        const bool segmented = isSegmentedProtocol(proto);
         const int height = f.value("height").isNull() ? 0 : f.value("height").toInt();
         const double fps = f.value("fps").isNull() ? 0.0 : f.value("fps").toDouble();
         const QString ext = f.value("ext").toString();
 
-        qint64 size = -1;
-        if (!f.value("filesize").isNull())
-            size = static_cast<qint64>(f.value("filesize").toDouble());
-        else if (!f.value("filesize_approx").isNull())
-            size = static_cast<qint64>(f.value("filesize_approx").toDouble());
+        const qint64 size = formatFilesize(f);
 
         const QString id = f.value("format_id").toString();
         QJsonObject o;
@@ -228,11 +240,7 @@ QJsonObject singleFormatFromInfo(const QJsonObject& info) {
     const QString proto = info.value("protocol").toString();
     const int height = info.value("height").isNull() ? 0 : info.value("height").toInt();
     const double fps = info.value("fps").isNull() ? 0.0 : info.value("fps").toDouble();
-    qint64 size = -1;
-    if (!info.value("filesize").isNull())
-        size = static_cast<qint64>(info.value("filesize").toDouble());
-    else if (!info.value("filesize_approx").isNull())
-        size = static_cast<qint64>(info.value("filesize_approx").toDouble());
+    const qint64 size = formatFilesize(info);
     const QString id = info.value("format_id").toString();
 
     QJsonObject o;
@@ -242,8 +250,7 @@ QJsonObject singleFormatFromInfo(const QJsonObject& info) {
     o.insert("hasVideo", true);   // a complete container -- treat as progressive
     o.insert("hasAudio", true);
     o.insert("needsAudioMerge", false);
-    o.insert("segmented", proto.contains(QLatin1String("m3u8")) ||
-                              proto.contains(QLatin1String("dash")));
+    o.insert("segmented", isSegmentedProtocol(proto));
     if (height > 0) o.insert("height", height);
     if (fps > 0) o.insert("fps", fps);
     o.insert("filesize", static_cast<double>(size));

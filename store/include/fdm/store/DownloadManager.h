@@ -4,6 +4,7 @@
 #include <QList>
 #include <QObject>
 #include <QPair>
+#include <QSet>
 #include <QString>
 #include <QtGlobal>
 
@@ -128,6 +129,13 @@ private:
     void onEngineEvent(qint64 id, fdm::EngineEvent ev);
     void persistChunks(qint64 id);
     void persistProgressThrottled(qint64 id);
+    // Write the row's current chunk set to the DB now: a full replaceChunks
+    // when the layout grew/changed (so new rows are INSERTed), else a cheaper
+    // in-place updateChunkProgress. Clears the dirty flag. No-op if empty.
+    void flushChunks(qint64 id);
+    // Build the queued engine-event callback for `id`: hops the event back onto
+    // this object's thread before dispatching to onEngineEvent.
+    std::function<void(fdm::EngineEvent)> makeEngineCallback(qint64 id);
     DownloadLiveRow* find(qint64 id);
     fdm::ResumeSpec buildResumeSpec(const DownloadLiveRow& row) const;
     // Drives a row from "bytes finished" to "verification verdict written".
@@ -142,6 +150,10 @@ private:
     void spawnVideo(qint64 id);                       // (re)launch the child
     void onVideoLine(qint64 id, const QString& line); // parse one output line
     void finishVideo(qint64 id, bool ok, const QString& error);
+    // Apply a pending pause/cancel intent to a finished video row. Returns true
+    // if an intent was handled (caller stops); false to proceed to ok/fail.
+    // Callers do their own temp-file cleanup before calling.
+    bool applyVideoIntent(qint64 id, const QString& intent);
 
     // --- video via the multi-connection engine + ffmpeg mux ------------------
     // resolveVideo runs `yt-dlp -J` to get the direct stream URL(s); single-file
@@ -167,6 +179,11 @@ private:
     // Last wall-clock time (ms since epoch) we wrote chunk progress for a
     // download. Throttles DB writes to avoid hammering SQLite at 10 Hz.
     QHash<qint64, qint64> lastPersistMs_;
+
+    // Downloads whose chunk layout grew/changed since the last DB flush. The
+    // next flush rewrites the whole chunk set (replaceChunks) for these instead
+    // of an in-place update, so newly split segments get persisted.
+    QSet<qint64> chunkLayoutDirty_;
 
     // Running yt-dlp child processes, keyed by download id. videoIntent_ records
     // why we're about to stop one ("cancel"/"pause") so the finished handler

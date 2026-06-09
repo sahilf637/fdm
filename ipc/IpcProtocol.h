@@ -22,6 +22,12 @@ inline QString serverName() {
 
 inline constexpr int kIoTimeoutMs = 3000;
 
+// Upper bound on a single framed message. The native host already caps the
+// browser payload it forwards at 1 MiB; this guards the server side against a
+// buggy/hostile local client announcing a huge length and growing the read
+// buffer without bound. Generous headroom over the host's cap.
+inline constexpr quint32 kMaxMessageBytes = 8u * 1024 * 1024;
+
 // Serialize one framed message into a buffer ready to write to a socket.
 inline QByteArray frame(const QByteArray& payload) {
     QByteArray buf;
@@ -50,6 +56,12 @@ inline bool tryReadMessage(QByteArray& buffer, QByteArray& out) {
         QDataStream peek(buffer);
         peek.setVersion(QDataStream::Qt_6_0);
         peek >> len;
+    }
+    if (len > kMaxMessageBytes) {
+        // Bogus/oversized frame: drop the buffer rather than wait (and grow)
+        // for bytes that may never arrive. The stream is unrecoverable anyway.
+        buffer.clear();
+        return false;
     }
     if (buffer.size() < static_cast<int>(sizeof(quint32) + len)) return false;
     QDataStream in(&buffer, QIODevice::ReadOnly);

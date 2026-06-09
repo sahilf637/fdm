@@ -19,6 +19,18 @@ function suppressed(url) {
   return exp > Date.now();
 }
 
+// Record a fallback URL so its self-triggered onCreated is skipped. Prunes
+// expired entries first: suppressed() only deletes on a hit, so a URL that
+// falls back once and never recurs would otherwise linger for the worker's
+// lifetime.
+function rememberFallback(url) {
+  const now = Date.now();
+  for (const [u, exp] of recentFallback) {
+    if (exp <= now) recentFallback.delete(u);
+  }
+  recentFallback.set(url, now + 15000);
+}
+
 // Cache the toggle in memory so onCreated can decide synchronously and cancel
 // the browser's download before it makes progress. Kept in sync with storage.
 let enabled = true;
@@ -86,7 +98,7 @@ async function captureUrl(url, opts = {}) {
   const resp = await sendToFdm({ url, filename: opts.filename || "", headers });
   if (!resp.ok) {
     notify("Couldn't reach FDM — downloading in the browser instead.");
-    recentFallback.set(url, Date.now() + 15000);
+    rememberFallback(url);
     chrome.downloads.download({ url });
   }
   return resp;

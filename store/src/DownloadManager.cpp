@@ -260,13 +260,7 @@ qint64 DownloadManager::startNew(const QString& url, const QString& outputPath,
     DownloadLiveRow* live = find(id);
     live->engineId = engine_->start(
         url.toStdString(), outputPath.toStdString(), toEngineHeaders(headers),
-        [this, id](fdm::EngineEvent ev) {
-            QMetaObject::invokeMethod(
-                this, [this, id, ev = std::move(ev)]() mutable {
-                    onEngineEvent(id, std::move(ev));
-                },
-                Qt::QueuedConnection);
-        });
+        makeEngineCallback(id));
     return id;
 }
 
@@ -411,6 +405,25 @@ void DownloadManager::onVideoLine(qint64 id, const QString& line) {
     if (line.startsWith(kDest)) videoFinalPath_[id] = line.mid(kDest.size());
 }
 
+bool DownloadManager::applyVideoIntent(qint64 id, const QString& intent) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return true;  // row gone; nothing left to do
+    if (intent == "cancel") {
+        row->rec.status = DownloadStatus::Failed;
+        row->rec.error = "Cancelled";
+        db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
+        emit rowChanged(id);
+        return true;
+    }
+    if (intent == "pause") {
+        row->rec.status = DownloadStatus::Paused;
+        db_->updateDownloadStatus(id, DownloadStatus::Paused);
+        emit rowChanged(id);
+        return true;
+    }
+    return false;
+}
+
 void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
     if (auto it = videoProcs_.find(id); it != videoProcs_.end()) {
         it.value()->deleteLater();
@@ -424,21 +437,8 @@ void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
     }
     row->bytesPerSec = 0;
     const QString intent = videoIntent_.take(id);
-
-    if (intent == "cancel") {
-        row->rec.status = DownloadStatus::Failed;
-        row->rec.error = "Cancelled";
-        db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
-        videoFinalPath_.remove(id);
-        emit rowChanged(id);
-        return;
-    }
-    if (intent == "pause") {
-        row->rec.status = DownloadStatus::Paused;
-        db_->updateDownloadStatus(id, DownloadStatus::Paused);
-        emit rowChanged(id);
-        return;
-    }
+    if (intent == "cancel") videoFinalPath_.remove(id);
+    if (applyVideoIntent(id, intent)) return;
     if (ok) {
         const QString fp = videoFinalPath_.take(id);
         if (!fp.isEmpty() && fp != row->rec.outputPath) {
@@ -741,20 +741,8 @@ void DownloadManager::finishEngineVideo(qint64 id, bool ok, const QString& error
     }
     row->bytesPerSec = 0;
     const QString intent = videoIntent_.take(id);
-    if (intent == "cancel") {
-        if (!finalPath.isEmpty()) QFile::remove(finalPath);
-        row->rec.status = DownloadStatus::Failed;
-        row->rec.error = "Cancelled";
-        db_->updateDownloadStatus(id, DownloadStatus::Failed, "Cancelled");
-        emit rowChanged(id);
-        return;
-    }
-    if (intent == "pause") {
-        row->rec.status = DownloadStatus::Paused;
-        db_->updateDownloadStatus(id, DownloadStatus::Paused);
-        emit rowChanged(id);
-        return;
-    }
+    if (intent == "cancel" && !finalPath.isEmpty()) QFile::remove(finalPath);
+    if (applyVideoIntent(id, intent)) return;
     if (ok) {
         const QString path = finalPath.isEmpty() ? row->rec.outputPath : finalPath;
         const qint64 sz = QFileInfo(path).size();
@@ -902,14 +890,7 @@ void DownloadManager::resume(qint64 id) {
         emit rowChanged(id);
         row->engineId = engine_->start(
             row->rec.url.toStdString(), row->rec.outputPath.toStdString(),
-            headersFromJson(row->rec.requestHeaders),
-            [this, id](fdm::EngineEvent ev) {
-                QMetaObject::invokeMethod(
-                    this, [this, id, ev = std::move(ev)]() mutable {
-                        onEngineEvent(id, std::move(ev));
-                    },
-                    Qt::QueuedConnection);
-            });
+            headersFromJson(row->rec.requestHeaders), makeEngineCallback(id));
         return;
     }
 
@@ -918,14 +899,7 @@ void DownloadManager::resume(qint64 id) {
     row->rec.error.clear();
     db_->updateDownloadStatus(id, DownloadStatus::Active);
     emit rowChanged(id);
-    row->engineId = engine_->resumeKnown(
-        std::move(spec), [this, id](fdm::EngineEvent ev) {
-            QMetaObject::invokeMethod(
-                this, [this, id, ev = std::move(ev)]() mutable {
-                    onEngineEvent(id, std::move(ev));
-                },
-                Qt::QueuedConnection);
-        });
+    row->engineId = engine_->resumeKnown(std::move(spec), makeEngineCallback(id));
 }
 
 void DownloadManager::retry(qint64 id) {
@@ -960,18 +934,12 @@ void DownloadManager::retry(qint64 id) {
     db_->updateDownloadTotals(id, -1, false);
     db_->replaceChunks(id, {});
     lastPersistMs_.remove(id);
+    chunkLayoutDirty_.remove(id);
     emit rowChanged(id);
 
     row->engineId = engine_->start(
         row->rec.url.toStdString(), row->rec.outputPath.toStdString(),
-        headersFromJson(row->rec.requestHeaders),
-        [this, id](fdm::EngineEvent ev) {
-            QMetaObject::invokeMethod(
-                this, [this, id, ev = std::move(ev)]() mutable {
-                    onEngineEvent(id, std::move(ev));
-                },
-                Qt::QueuedConnection);
-        });
+        headersFromJson(row->rec.requestHeaders), makeEngineCallback(id));
 }
 
 void DownloadManager::cancel(qint64 id) {
@@ -1021,6 +989,7 @@ void DownloadManager::remove(qint64 id, bool alsoRemoveFile) {
     rows_.remove(id);
     rowOrder_.removeAll(id);
     lastPersistMs_.remove(id);
+    chunkLayoutDirty_.remove(id);
     if (alsoRemoveFile && !filePath.isEmpty()) {
         QFile::remove(filePath);
     }
@@ -1045,6 +1014,7 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 db_->updateDownloadTotals(id, e.contentLength, e.supportsRanges);
                 db_->replaceChunks(id, row->chunks);
                 lastPersistMs_[id] = QDateTime::currentMSecsSinceEpoch();
+                chunkLayoutDirty_.remove(id);  // just wrote the full layout
                 // If the server volunteered a digest AND the user didn't
                 // already supply one at startNew time, persist it. User
                 // hashes always win over server-side discovery.
@@ -1061,9 +1031,13 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 }
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Progress>) {
-                // Dynamic re-segmentation grows the segment set at runtime. When
-                // the count changes, rewrite the whole chunk layout (insert the
-                // new rows); otherwise just update byte counts in place.
+                // Dynamic re-segmentation grows the segment set at runtime.
+                // When the count changes, the next DB flush must rewrite the
+                // whole layout (to INSERT the new rows) instead of an in-place
+                // update -- but it still goes through the 2s throttle rather
+                // than writing on every split, which can fire many times early
+                // in a large download. A crash before the flush only costs a
+                // little redundant re-download on resume, never correctness.
                 const bool layoutChanged =
                     row->chunks.size() != static_cast<int>(e.chunks.size());
                 row->chunks = chunksFromProgress(e.chunks);
@@ -1076,12 +1050,8 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                                        ? e.bytesPerSec
                                        : kAlpha * e.bytesPerSec +
                                              (1.0 - kAlpha) * row->bytesPerSec;
-                if (layoutChanged) {
-                    db_->replaceChunks(id, row->chunks);
-                    lastPersistMs_[id] = QDateTime::currentMSecsSinceEpoch();
-                } else {
-                    persistProgressThrottled(id);
-                }
+                if (layoutChanged) chunkLayoutDirty_.insert(id);
+                persistProgressThrottled(id);
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Paused>) {
                 row->rec.status = DownloadStatus::Paused;
@@ -1089,9 +1059,7 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 db_->updateDownloadStatus(id, DownloadStatus::Paused);
                 // Always flush on a state transition; throttling is only
                 // for the high-frequency Progress path.
-                if (!row->chunks.isEmpty()) {
-                    db_->updateChunkProgress(id, row->chunks);
-                }
+                flushChunks(id);
                 emit rowChanged(id);
             } else if constexpr (std::is_same_v<T, fdm::Finished>) {
                 row->engineId = 0;
@@ -1110,9 +1078,7 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 }
                 // Persist final chunk state, then transition to Finalizing.
                 // The actual Completed transition happens after hash check.
-                if (!row->chunks.isEmpty()) {
-                    db_->updateChunkProgress(id, row->chunks);
-                }
+                flushChunks(id);
                 row->rec.status = DownloadStatus::Finalizing;
                 db_->updateDownloadStatus(id, DownloadStatus::Finalizing);
                 emit rowChanged(id);
@@ -1123,9 +1089,7 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 row->rec.error = QString::fromStdString(e.reason);
                 row->bytesPerSec = 0;
                 db_->updateDownloadStatus(id, DownloadStatus::Failed, row->rec.error);
-                if (!row->chunks.isEmpty()) {
-                    db_->updateChunkProgress(id, row->chunks);
-                }
+                flushChunks(id);
                 emit rowChanged(id);
             }
         },
@@ -1250,7 +1214,27 @@ void DownloadManager::persistProgressThrottled(qint64 id) {
     const qint64 last = lastPersistMs_.value(id, 0);
     if (now - last < kPersistThrottleMs) return;
     lastPersistMs_[id] = now;
-    db_->updateChunkProgress(id, row->chunks);
+    flushChunks(id);
+}
+
+void DownloadManager::flushChunks(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row || row->chunks.isEmpty()) return;
+    if (chunkLayoutDirty_.remove(id)) {
+        db_->replaceChunks(id, row->chunks);
+    } else {
+        db_->updateChunkProgress(id, row->chunks);
+    }
+}
+
+std::function<void(fdm::EngineEvent)> DownloadManager::makeEngineCallback(qint64 id) {
+    return [this, id](fdm::EngineEvent ev) {
+        QMetaObject::invokeMethod(
+            this, [this, id, ev = std::move(ev)]() mutable {
+                onEngineEvent(id, std::move(ev));
+            },
+            Qt::QueuedConnection);
+    };
 }
 
 }  // namespace fdm::store
