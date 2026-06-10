@@ -52,6 +52,11 @@ struct ResumeSpec {
     // so an authenticated download (cookies, referer) resumes the same way it
     // started.
     std::vector<std::string> headers;
+    // If-Range validator captured by the original probe (see
+    // Started::validator). When non-empty it is sent on every ranged chunk
+    // request; a changed resource then returns 200 and the download fails
+    // instead of corrupting the file. Empty = resume without protection.
+    std::string validator;
 };
 
 // Attached to a curl easy handle via CURLOPT_PRIVATE. The engine reads this

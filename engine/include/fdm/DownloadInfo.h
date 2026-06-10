@@ -21,6 +21,12 @@ struct DownloadInfo {
     std::string expectedHash;
     std::string hashAlgorithm;  // "sha256" | "sha1" | "md5"
     std::string hashSource;     // "content-digest" | "digest" | "content-md5"
+    // Resource validator for If-Range: a strong ETag if the server sent one,
+    // else the Last-Modified date. Sent verbatim with every ranged chunk
+    // request so a resource that changed mid-download/across resume comes
+    // back as a 200 (detected and failed) instead of silently mixing bytes
+    // from two versions. Empty when the server provided neither.
+    std::string validator;
 };
 
 }  // namespace fdm

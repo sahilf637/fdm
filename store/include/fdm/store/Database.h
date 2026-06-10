@@ -69,6 +69,10 @@ struct DownloadRecord {
     // selector, persisted so a video download survives pause/restart.
     QString kind;            // empty is treated as "http"
     QString videoSelector;
+    // If-Range validator (strong ETag or Last-Modified) captured by the
+    // engine's probe. Replayed on resume so a remote file that changed
+    // between sessions fails loudly instead of corrupting the partial file.
+    QString validator;
 };
 
 struct ChunkRecord {
@@ -104,6 +108,9 @@ public:
 
     // Persists post-probe metadata (total size and range support).
     void updateDownloadTotals(qint64 id, qint64 totalBytes, bool supportsRanges);
+
+    // Persists the probe's If-Range validator (see DownloadRecord::validator).
+    void updateValidator(qint64 id, const QString& validator);
 
     // Updates the saved output path. Video downloads only learn their final
     // filename/extension once yt-dlp has muxed the file.

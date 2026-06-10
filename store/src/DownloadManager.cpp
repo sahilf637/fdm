@@ -928,6 +928,7 @@ fdm::ResumeSpec DownloadManager::buildResumeSpec(const DownloadLiveRow& row) con
     spec.totalBytes = row.rec.totalBytes;
     spec.supportsRanges = row.rec.supportsRanges;
     spec.headers = headersFromJson(row.rec.requestHeaders);
+    spec.validator = row.rec.validator.toStdString();
     spec.chunks.reserve(row.chunks.size());
     for (const ChunkRecord& c : row.chunks) {
         fdm::ChunkRestore r;
@@ -1133,6 +1134,12 @@ void DownloadManager::onEngineEvent(qint64 id, fdm::EngineEvent ev) {
                 db_->replaceChunks(id, row->chunks);
                 lastPersistMs_[id] = QDateTime::currentMSecsSinceEpoch();
                 chunkLayoutDirty_.remove(id);  // just wrote the full layout
+                // Persist the probe's If-Range validator so a resume after
+                // restart can detect a changed remote file.
+                if (!e.validator.empty()) {
+                    row->rec.validator = QString::fromStdString(e.validator);
+                    db_->updateValidator(id, row->rec.validator);
+                }
                 // If the server volunteered a digest AND the user didn't
                 // already supply one at startNew time, persist it. User
                 // hashes always win over server-side discovery.

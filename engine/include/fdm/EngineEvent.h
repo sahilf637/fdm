@@ -36,6 +36,10 @@ struct Started {
     std::string expectedHash;         // lowercased hex
     std::string hashAlgorithm;        // "sha256" | "sha1" | "md5"
     std::string hashSource;           // "content-digest" | "digest" | "content-md5"
+    // If-Range validator (strong ETag or Last-Modified) captured at probe
+    // time. Persist it and replay it via ResumeSpec::validator so a resumed
+    // download notices when the remote file changed. Empty if unavailable.
+    std::string validator;
 };
 
 struct Progress {

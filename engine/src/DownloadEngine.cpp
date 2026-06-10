@@ -15,6 +15,7 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -44,6 +45,16 @@ constexpr int kMaxConnections = 8;
 constexpr std::int64_t kMinSplitBytes = 1024 * 1024;  // 1 MiB
 constexpr std::chrono::seconds kStallTimeout{120};
 constexpr std::chrono::seconds kGrowQuietWindow{5};
+// A segment that keeps failing transiently eventually gives up for good --
+// without a cap, "transient" errors from a permanently sick server would
+// retry until the stall watchdog happens to catch a quiet moment.
+constexpr int kMaxSegmentAttempts = 10;
+// Upper bound on how long we honor a server's Retry-After. Anything larger
+// would collide with the stall watchdog; fall back to it instead.
+constexpr long kMaxRetryAfterSecs = 60;
+// Bound on total connections to a single host across all concurrent
+// downloads (each download already caps itself at kMaxConnections).
+constexpr long kMaxHostConnections = 2 * kMaxConnections;
 
 // Classify a transfer outcome as retryable (transient) or fatal. Driven by
 // libcurl error code first; for FAILONERROR-triggered HTTP errors the HTTP
@@ -79,10 +90,15 @@ RetryDecision classifyError(CURLcode rc, long httpCode) {
 }
 
 // Backoff schedule, exponential and bounded:
-//   retry #1 -> 500 ms, #2 -> 1 s, #3 -> 2 s, #4+ -> 4 s (cap).
+//   retry #1 -> 500 ms, #2 -> 1 s, #3 -> 2 s, #4+ -> 4 s (cap),
+// with +/-25% jitter so parallel segments knocked back by the same 429 /
+// reset don't re-stampede the server in lockstep.
 std::chrono::milliseconds backoffFor(int retryAttempt) {
     const int shift = std::clamp(retryAttempt - 1, 0, 3);
-    return std::chrono::milliseconds(500 * (1 << shift));
+    const long base = 500L * (1 << shift);
+    static thread_local std::minstd_rand rng{std::random_device{}()};
+    std::uniform_int_distribution<long> jitter(-base / 4, base / 4);
+    return std::chrono::milliseconds(base + jitter(rng));
 }
 
 // Friendlier error string than curl_easy_strerror for HTTP-status failures.
@@ -101,6 +117,9 @@ struct HeaderState {
     std::int64_t contentRangeTotal = -1;   // populated from "Content-Range: bytes A-B/TOTAL" (206 path)
     bool acceptRanges = false;             // populated from "Accept-Ranges: bytes"
     std::string suggestedFilename;         // populated from Content-Disposition
+    std::string etag;                      // populated from "ETag:" (verbatim, quotes kept)
+    std::string lastModified;              // populated from "Last-Modified:" (verbatim)
+    long retryAfterSecs = -1;              // from "Retry-After:" (seconds form only)
     // Best digest captured so far. Subsequent stronger algorithms overwrite
     // weaker ones; weaker never overwrite stronger.
     std::string expectedHash;
@@ -362,9 +381,27 @@ std::size_t headerCallback(char* buf, std::size_t size, std::size_t nmemb, void*
         return p;
     };
 
+    auto trimmedValue = [&](const char* p) {
+        const char* e = buf + len;
+        while (e > p && (*(e - 1) == ' ' || *(e - 1) == '\t')) --e;
+        return std::string(p, e - p);
+    };
+
     if (startsWithCI(buf, len, "content-length:")) {
         const char* p = skipValueWhitespace(buf + std::strlen("content-length:"), buf + len);
         st->contentLength = std::strtoll(p, nullptr, 10);
+    } else if (startsWithCI(buf, len, "etag:")) {
+        const char* p = skipValueWhitespace(buf + std::strlen("etag:"), buf + len);
+        st->etag = trimmedValue(p);
+    } else if (startsWithCI(buf, len, "last-modified:")) {
+        const char* p = skipValueWhitespace(buf + std::strlen("last-modified:"), buf + len);
+        st->lastModified = trimmedValue(p);
+    } else if (startsWithCI(buf, len, "retry-after:")) {
+        // Seconds form only; HTTP-date form is ignored (normal backoff applies).
+        const char* p = skipValueWhitespace(buf + std::strlen("retry-after:"), buf + len);
+        if (p < buf + len && *p >= '0' && *p <= '9') {
+            st->retryAfterSecs = std::strtol(p, nullptr, 10);
+        }
     } else if (startsWithCI(buf, len, "accept-ranges:")) {
         const char* p = skipValueWhitespace(buf + std::strlen("accept-ranges:"), buf + len);
         if (equalsCI(p, len - (p - buf), "bytes")) {
@@ -471,15 +508,18 @@ struct DownloadEngine::DownloadState {
     std::int64_t totalBytes = -1;
     bool supportsRanges = false;
     bool openEnded = false;            // unknown size / no ranges -> single EOF-terminated segment
+    bool probing = false;              // registered but still waiting on the probe
     std::string expectedHash;
     std::string hashAlgorithm;
     std::string hashSource;
+    std::string validator;             // If-Range value sent on every ranged chunk
 
     std::deque<Segment> segments;      // deque: element pointers survive push_back
     int nextSegmentIndex = 0;
     int connLimit = kInitialConnections;
     int activeCount = 0;
     std::chrono::steady_clock::time_point lastThrottle{};
+    std::chrono::steady_clock::time_point lastGrowAt{};
 
     // Tasks awaiting destruction -- a ChunkTask can't be deleted from inside its
     // own curl completion callback; cleared at the top of each run-loop tick.
@@ -597,6 +637,9 @@ DownloadEngine::DownloadEngine() {
     // Let chunk requests to an HTTP/2 host multiplex over a single connection
     // instead of opening (and handshaking) a fresh one each. No-op on HTTP/1.x.
     curl_multi_setopt(multi_, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+    // Keep N parallel downloads from the same host from stacking N * 8
+    // connections onto one server.
+    curl_multi_setopt(multi_, CURLMOPT_MAX_HOST_CONNECTIONS, kMaxHostConnections);
     thread_ = std::thread([this] { runLoop(); });
 }
 
@@ -653,6 +696,15 @@ void DownloadEngine::probe(std::string url, std::vector<std::string> headers,
     curl_easy_setopt(state->easy, CURLOPT_WRITEDATA, state);
     curl_easy_setopt(state->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(state->easy, CURLOPT_MAXREDIRS, 5L);
+    // Never follow a redirect out of HTTP(S) -- libcurl's default redirect
+    // set still includes FTP.
+#if CURL_AT_LEAST_VERSION(7, 85, 0)
+    curl_easy_setopt(state->easy, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(state->easy, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(state->easy, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(state->easy, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(state->easy, CURLOPT_HEADERFUNCTION, headerCallback);
     curl_easy_setopt(state->easy, CURLOPT_HEADERDATA, &state->header);
     curl_easy_setopt(state->easy, CURLOPT_USERAGENT, "fdm/0.1");
@@ -691,6 +743,13 @@ void DownloadEngine::probe(std::string url, std::vector<std::string> headers,
             result.info.expectedHash = state->header.expectedHash;
             result.info.hashAlgorithm = state->header.hashAlgorithm;
             result.info.hashSource = state->header.hashSource;
+            // If-Range needs a strong validator: a non-weak ETag, else the
+            // Last-Modified date (RFC 9110 13.1.5).
+            if (!state->header.etag.empty() && state->header.etag.rfind("W/", 0) != 0) {
+                result.info.validator = state->header.etag;
+            } else if (!state->header.lastModified.empty()) {
+                result.info.validator = state->header.lastModified;
+            }
             char* eff = nullptr;
             curl_easy_getinfo(state->easy, CURLINFO_EFFECTIVE_URL, &eff);
             if (eff) result.info.finalUrl = eff;
@@ -709,14 +768,19 @@ void DownloadEngine::probe(std::string url, std::vector<std::string> headers,
             return;
         }
 
-        // Failure: retry transient errors with exponential backoff.
+        // Failure: retry transient errors with exponential backoff, stretched
+        // to the server's Retry-After when it sent one (bounded).
         if (state->attempts < kMaxProbeAttempts &&
             classifyError(rc, http) == RetryDecision::Retry) {
             state->attempts++;
+            auto delay = backoffFor(state->attempts - 1);
+            if (state->header.retryAfterSecs > 0) {
+                delay = std::max(delay, std::chrono::milliseconds(
+                    std::min(state->header.retryAfterSecs, kMaxRetryAfterSecs) * 1000));
+            }
             state->header = HeaderState{};
             retries_.push_back(PendingRetry{
-                state->easy,
-                std::chrono::steady_clock::now() + backoffFor(state->attempts - 1)});
+                state->easy, std::chrono::steady_clock::now() + delay});
             return;
         }
 
@@ -745,10 +809,10 @@ DownloadEngine::Segment* DownloadEngine::findSegment(DownloadState* state, int i
     return nullptr;
 }
 
-// Seed a download's initial segments, emit Started (fresh only), register it,
-// and start pumping. `restoreOverlay` carries per-segment resume state (nullptr
-// for a brand-new download). Caller already populated url/outputPath/onEvent/
-// totalBytes/openEnded/id.
+// Seed a download's initial segments, emit Started (fresh only), and start
+// pumping. The caller has already registered `state` in activeStates_ and
+// populated url/outputPath/onEvent/totalBytes/openEnded/id. `restoreOverlay`
+// carries per-segment resume state (nullptr for a brand-new download).
 void DownloadEngine::beginDownload(DownloadState* state,
                                    const std::vector<ChunkSpec>& chunks,
                                    const std::vector<ChunkRestore>* restoreOverlay) {
@@ -761,9 +825,10 @@ void DownloadEngine::beginDownload(DownloadState* state,
         zero.expectedHash = state->expectedHash;
         zero.hashAlgorithm = state->hashAlgorithm;
         zero.hashSource = state->hashSource;
+        zero.validator = state->validator;
         state->emit(std::move(zero));
         state->emit(Finished{});
-        delete state;
+        state->done = true;  // reaped on the next run-loop tick
         return;
     }
 
@@ -784,6 +849,14 @@ void DownloadEngine::beginDownload(DownloadState* state,
                     break;
                 }
             }
+            // A chunk persisted mid-write may already hold every byte of its
+            // range (crash between the last write and the status flush).
+            // Requesting "end+1 - end" would be an invalid range (416); it's
+            // simply done.
+            if (seg.status != ChunkProgress::Status::Done && seg.endByte >= 0 &&
+                seg.bytesReceived >= seg.endByte - seg.startByte + 1) {
+                seg.status = ChunkProgress::Status::Done;
+            }
         }
         maxIndex = std::max(maxIndex, seg.index);
         state->segments.push_back(std::move(seg));
@@ -802,6 +875,7 @@ void DownloadEngine::beginDownload(DownloadState* state,
         started.expectedHash = state->expectedHash;
         started.hashAlgorithm = state->hashAlgorithm;
         started.hashSource = state->hashSource;
+        started.validator = state->validator;
         state->emit(std::move(started));
     }
 
@@ -810,7 +884,7 @@ void DownloadEngine::beginDownload(DownloadState* state,
     state->lastEmitReceived = sumReceived(*state);
     state->lastAdvanceAt = now;
     state->lastAdvanceBytes = state->lastEmitReceived;
-    activeStates_.push_back(state);
+    state->lastGrowAt = now;
 
     bool allDone = true;
     for (const auto& seg : state->segments)
@@ -848,7 +922,7 @@ void DownloadEngine::startSegment(DownloadState* state, Segment* seg) {
         seg->task = std::make_unique<ChunkTask>(
             state->url, state->outputPath,
             ChunkSpec{seg->startByte, seg->endByte, seg->index}, state->headers,
-            seg->bytesReceived, seg->attempts);
+            seg->bytesReceived, seg->attempts, state->validator);
     } catch (const std::exception& e) {
         failDownload(state, e.what());  // couldn't open the file etc.
         return;
@@ -909,31 +983,49 @@ void DownloadEngine::onSegmentDone(DownloadState* state, int segIndex, CURLcode 
     Segment* seg = findSegment(state, segIndex);
     if (!seg) return;
 
-    // Snapshot received bytes and retire the task (destroyed at the next tick --
-    // we're inside its own callback right now).
+    // Snapshot received bytes + per-attempt response facts, then retire the
+    // task (destroyed at the next tick -- we're inside its own callback).
+    bool fullBodyForRange = false;
+    long retryAfterSecs = -1;
     if (seg->task) {
         seg->bytesReceived = seg->task->bytesWritten();
+        fullBodyForRange = seg->task->sawFullBodyForRange();
+        retryAfterSecs = seg->task->retryAfterSecs();
         state->reaping.push_back(std::move(seg->task));
     }
-    state->activeCount--;
     if (state->done) return;  // a sibling already drove us terminal
+    state->activeCount--;
 
     if (capped || rc == CURLE_OK) {
         seg->status = ChunkProgress::Status::Done;
-        // Adaptive grow: after a quiet spell with no throttling, allow one more
-        // connection (up to the cap). pump() opens it by splitting.
-        const auto now = std::chrono::steady_clock::now();
-        if (state->connLimit < kMaxConnections &&
-            (state->lastThrottle.time_since_epoch().count() == 0 ||
-             now - state->lastThrottle >= kGrowQuietWindow)) {
-            state->connLimit++;
-        }
+    } else if (http == 416 && seg->endByte < 0 && seg->bytesReceived > 0) {
+        // Open-ended resume asked for "N-" and the server can't satisfy it:
+        // the file is exactly N bytes long, i.e. already fully on disk.
+        seg->status = ChunkProgress::Status::Done;
+    } else if (fullBodyForRange) {
+        // The server answered our ranged request with a full body (or the
+        // wrong range): either it ignores Range or, with If-Range set, the
+        // remote file changed. Retrying won't change its mind -- and writing
+        // the body at this chunk's offset would corrupt the file.
+        failDownload(state, "ranged request not honored (file changed on server?)");
+        return;
     } else if (classifyError(rc, http) == RetryDecision::Retry) {
-        // Transient (429 / connect / timeout / reset): requeue -- never fatal.
+        // Transient (429 / connect / timeout / reset): requeue with backoff,
+        // but give up for good after too many failed attempts on one segment.
         seg->status = ChunkProgress::Status::Pending;
         seg->attempts++;
+        if (seg->attempts > kMaxSegmentAttempts) {
+            failDownload(state, "too many retries: " + describeError(rc, http));
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
-        seg->dueAt = now + backoffFor(seg->attempts - 1);
+        auto delay = backoffFor(seg->attempts - 1);
+        // The server told us when to come back; honor it (bounded).
+        if (retryAfterSecs > 0) {
+            delay = std::max(delay, std::chrono::milliseconds(
+                std::min(retryAfterSecs, kMaxRetryAfterSecs) * 1000));
+        }
+        seg->dueAt = now + delay;
         if (http == 429) {
             // Server is rate-limiting concurrency: back the cap off (AIMD).
             state->connLimit = std::max(1, state->connLimit - 1);
@@ -954,6 +1046,21 @@ void DownloadEngine::maybeFinish(DownloadState* state) {
     // All segments Done -> the file is complete (segments tile [0,total)).
     const auto now = std::chrono::steady_clock::now();
     const std::int64_t received = sumReceived(*state);
+    // Cheap insurance against scheduler bugs and lying servers: never claim
+    // success for a file we know is the wrong size.
+    if (state->totalBytes >= 0 && received != state->totalBytes) {
+        failDownload(state, "size mismatch: received " + std::to_string(received) +
+                                " of " + std::to_string(state->totalBytes) + " bytes");
+        return;
+    }
+    // Durability: land the bytes on stable storage before claiming success,
+    // so a crash right after Finished can't leave a file the caller recorded
+    // as complete with its tail still in the page cache.
+    const int fd = ::open(state->outputPath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ::fdatasync(fd);
+        ::close(fd);
+    }
     const double rate = computeBytesPerSec(*state, received, now);
     state->emit(Progress{received, state->totalBytes, rate, snapshotChunks(*state),
                          state->activeCount, state->connLimit});
@@ -997,43 +1104,55 @@ DownloadId DownloadEngine::start(std::string url,
     state->onEvent = std::move(onEvent);
     const DownloadId id = state->id;
 
-    probe(state->url, state->headers, [this, state](ProbeResult pr) {
-        if (!pr.ok) {
-            state->emit(Failed{pr.error});
-            delete state;
-            return;
-        }
+    // Register before probing so pause/cancel can address the download while
+    // the probe is still in flight -- against a dead host the probe can spend
+    // the better part of a minute in timeouts and retries.
+    post([this, state, id] {
+        state->probing = true;
+        activeStates_.push_back(state);
+        // The probe outcome looks itself up by id: cancel may have reaped the
+        // state (and freed the pointer) while the probe was on the wire.
+        probe(state->url, state->headers, [this, id](ProbeResult pr) {
+            DownloadState* state = findById(id);
+            if (!state || state->done) return;  // cancelled during probe
+            state->probing = false;
 
-        // Download the chunks straight from the post-redirect URL so each
-        // connection (and every retry) skips re-walking the redirect chain.
-        // FOLLOWLOCATION stays on per chunk as a safety net if it redirects
-        // again; an expired signed URL surfaces as a normal HTTP failure.
-        if (!pr.info.finalUrl.empty()) state->url = pr.info.finalUrl;
+            if (!pr.ok) {
+                failDownload(state, pr.error);
+                return;
+            }
 
-        state->totalBytes = pr.info.contentLength;
-        state->supportsRanges = pr.info.supportsRanges;
-        state->expectedHash = pr.info.expectedHash;
-        state->hashAlgorithm = pr.info.hashAlgorithm;
-        state->hashSource = pr.info.hashSource;
+            // Download the chunks straight from the post-redirect URL so each
+            // connection (and every retry) skips re-walking the redirect chain.
+            // FOLLOWLOCATION stays on per chunk as a safety net if it redirects
+            // again; an expired signed URL surfaces as a normal HTTP failure.
+            if (!pr.info.finalUrl.empty()) state->url = pr.info.finalUrl;
 
-        std::string err;
-        if (!preallocateFile(state->outputPath, pr.info.contentLength, &err)) {
-            state->emit(Failed{err});
-            delete state;
-            return;
-        }
+            state->totalBytes = pr.info.contentLength;
+            state->supportsRanges = pr.info.supportsRanges;
+            state->expectedHash = pr.info.expectedHash;
+            state->hashAlgorithm = pr.info.hashAlgorithm;
+            state->hashSource = pr.info.hashSource;
+            state->validator = pr.info.validator;
 
-        std::vector<ChunkSpec> chunks;
-        if (!pr.info.supportsRanges || pr.info.contentLength < 0) {
-            state->openEnded = true;
-            chunks.push_back(ChunkSpec{0, -1, 0});
-        } else {
-            // Seed only the initial connections; the pool grows segments
-            // dynamically as connections free up (see trySplitLargestActive).
-            chunks = splitIntoChunks(pr.info.contentLength, kInitialConnections,
-                                     kMinChunkSize);
-        }
-        beginDownload(state, chunks, /*restoreOverlay=*/nullptr);
+            std::string err;
+            if (!preallocateFile(state->outputPath, pr.info.contentLength, &err)) {
+                failDownload(state, err);
+                return;
+            }
+
+            std::vector<ChunkSpec> chunks;
+            if (!pr.info.supportsRanges || pr.info.contentLength < 0) {
+                state->openEnded = true;
+                chunks.push_back(ChunkSpec{0, -1, 0});
+            } else {
+                // Seed only the initial connections; the pool grows segments
+                // dynamically as connections free up (see trySplitLargestActive).
+                chunks = splitIntoChunks(pr.info.contentLength, kInitialConnections,
+                                         kMinChunkSize);
+            }
+            beginDownload(state, chunks, /*restoreOverlay=*/nullptr);
+        });
     });
     return id;
 }
@@ -1049,12 +1168,14 @@ DownloadId DownloadEngine::resumeKnown(ResumeSpec spec,
     state->totalBytes = spec.totalBytes;
     state->supportsRanges = spec.supportsRanges;
     state->openEnded = (!spec.supportsRanges || spec.totalBytes < 0);
+    state->validator = std::move(spec.validator);
     const DownloadId id = state->id;
 
     // Hop to the engine thread so libcurl / activeStates_ access is single-
     // threaded just like every other entry point.
     std::vector<ChunkRestore> restore = std::move(spec.chunks);
     post([this, state, restore = std::move(restore)]() mutable {
+        activeStates_.push_back(state);
         // Build ChunkSpecs from the restore overlay so segment indices stay
         // aligned. We trust the caller's split -- the partial file on disk was
         // sized for it. The scheduler resumes dynamic re-segmentation from here.
@@ -1125,11 +1246,12 @@ void DownloadEngine::runLoop() {
             }
         }
 
-        // Periodic Progress + stall watchdog for every live download.
+        // Periodic Progress + stall watchdog + adaptive grow for every live
+        // download.
         {
             const auto progNow = std::chrono::steady_clock::now();
             for (auto* st : activeStates_) {
-                if (st->paused || st->done) continue;
+                if (st->paused || st->done || st->probing) continue;
                 const std::int64_t r = sumReceived(*st);
                 if (r > st->lastAdvanceBytes) {
                     st->lastAdvanceBytes = r;
@@ -1140,6 +1262,19 @@ void DownloadEngine::runLoop() {
                     // up rather than spin on a server that keeps refusing.
                     failDownload(st, "stalled (no progress)");
                     continue;
+                }
+                // Adaptive grow: a throttle-free quiet window while actively
+                // transferring earns one more connection (up to the cap);
+                // pump() opens the slot by splitting the largest segment.
+                // Time-based, not completion-based: with multi-MiB segments,
+                // waiting for one to finish would defer full parallelism to
+                // the tail of the download.
+                if (st->activeCount > 0 && st->connLimit < kMaxConnections &&
+                    (st->lastThrottle.time_since_epoch().count() == 0 ||
+                     progNow - st->lastThrottle >= kGrowQuietWindow) &&
+                    progNow - st->lastGrowAt >= kGrowQuietWindow) {
+                    st->connLimit++;
+                    st->lastGrowAt = progNow;
                 }
                 if (progNow - st->lastProgressEmit >= kProgressInterval) {
                     const double rate = computeBytesPerSec(*st, r, progNow);

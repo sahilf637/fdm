@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     verification    TEXT,
     request_headers TEXT,
     kind            TEXT NOT NULL DEFAULT 'http',
-    video_selector  TEXT
+    video_selector  TEXT,
+    validator       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -189,6 +190,7 @@ Database::Database(const QString& dbPath) {
         {"request_headers", "request_headers TEXT"},
         {"kind",           "kind TEXT NOT NULL DEFAULT 'http'"},
         {"video_selector", "video_selector TEXT"},
+        {"validator",      "validator TEXT"},
     };
     for (const Col& c : required) {
         if (existing.contains(c.name)) continue;
@@ -212,8 +214,8 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
         "INSERT INTO downloads"
         " (url, output_path, total_bytes, supports_ranges, status, error, created_at, updated_at,"
         "  expected_hash, hash_algorithm, hash_source, actual_hash, verification, request_headers,"
-        "  kind, video_selector)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        "  kind, video_selector, validator)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     const qint64 now = nowSeconds();
     q.addBindValue(rec.url);
     q.addBindValue(rec.outputPath);
@@ -232,6 +234,7 @@ qint64 Database::insertDownload(const DownloadRecord& rec) {
     q.addBindValue(rec.requestHeaders.isEmpty() ? QVariant() : QVariant(rec.requestHeaders));
     q.addBindValue(rec.kind.isEmpty() ? QStringLiteral("http") : rec.kind);
     q.addBindValue(rec.videoSelector.isEmpty() ? QVariant() : QVariant(rec.videoSelector));
+    q.addBindValue(rec.validator.isEmpty() ? QVariant() : QVariant(rec.validator));
     exec(q, "insertDownload");
     return q.lastInsertId().toLongLong();
 }
@@ -297,6 +300,16 @@ void Database::updateDownloadTotals(qint64 id, qint64 totalBytes, bool supportsR
     q.addBindValue(static_cast<qlonglong>(nowSeconds()));
     q.addBindValue(static_cast<qlonglong>(id));
     exec(q, "updateDownloadTotals");
+}
+
+void Database::updateValidator(qint64 id, const QString& validator) {
+    QSqlDatabase db = QSqlDatabase::database(connectionName_);
+    QSqlQuery q(db);
+    q.prepare("UPDATE downloads SET validator = ?, updated_at = ? WHERE id = ?");
+    q.addBindValue(validator.isEmpty() ? QVariant() : QVariant(validator));
+    q.addBindValue(static_cast<qlonglong>(nowSeconds()));
+    q.addBindValue(static_cast<qlonglong>(id));
+    exec(q, "updateValidator");
 }
 
 void Database::updateDownloadOutputPath(qint64 id, const QString& outputPath) {
@@ -381,7 +394,7 @@ namespace {
 constexpr const char* kDownloadSelectColumns =
     "id, url, output_path, total_bytes, supports_ranges, status, error,"
     " created_at, updated_at, expected_hash, hash_algorithm, hash_source,"
-    " actual_hash, verification, request_headers, kind, video_selector";
+    " actual_hash, verification, request_headers, kind, video_selector, validator";
 
 DownloadRecord readDownloadRow(const QSqlQuery& q) {
     DownloadRecord r;
@@ -402,6 +415,7 @@ DownloadRecord readDownloadRow(const QSqlQuery& q) {
     r.requestHeaders = q.value(14).toString();
     r.kind = q.value(15).toString();
     r.videoSelector = q.value(16).toString();
+    r.validator = q.value(17).toString();
     return r;
 }
 
