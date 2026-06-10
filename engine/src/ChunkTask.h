@@ -17,8 +17,6 @@ namespace fdm {
 // duration of the download.
 class ChunkTask {
 public:
-    static constexpr int kMaxAttempts = 4;
-
     // initialBytesReceived = bytes already written for this chunk (only set
     // when restoring from persistent state). The constructor advances the
     // file pointer past them and configures CURLOPT_RANGE to resume after
@@ -36,17 +34,6 @@ public:
     // Hand the easy handle to the engine. onComplete fires on the engine
     // thread when libcurl reports CURLMSG_DONE for this handle.
     void start(DownloadEngine& engine, std::function<void(CURLcode)> onComplete);
-
-    // Configure the easy handle for a resumed attempt: adjusts CURLOPT_RANGE
-    // to (startByte + bytesWritten)-endByte. Returns true if a retry slot is
-    // available (attempts < kMaxAttempts), false if exhausted.
-    bool prepareRetry();
-
-    // Like prepareRetry, but without consuming a retry attempt. Used by
-    // DownloadEngine::resume to pick up where pause left off. Returns true
-    // if there is still work to do (resumeStart <= endByte), false if the
-    // chunk is already complete.
-    bool reconfigureForResume();
 
     // Lower this chunk's effective end (dynamic re-segmentation): the write
     // callback stops once it has written up to `newEnd` (inclusive), at which
@@ -77,6 +64,10 @@ private:
     int attempts_ = 1;  // counts attempts including the first
     std::int64_t capEnd_ = -1;       // effective inclusive end; -1 = open-ended
     bool cappedComplete_ = false;    // reached the cap (clean finish, not an error)
+    // Open-ended segment resumed with bytes already on disk: a Range request
+    // was sent on a best-effort basis. Checked (and cleared) on the first
+    // write to see whether the server honored it (206) or restarted (200).
+    bool openEndedResume_ = false;
 };
 
 }  // namespace fdm

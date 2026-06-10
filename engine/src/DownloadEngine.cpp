@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -223,19 +224,20 @@ int hashStrength(const std::string& alg) {
 // RFC 4648 base64 decode (no whitespace tolerance -- header values are
 // expected to be clean tokens). Returns "" on malformed input.
 std::string base64Decode(const std::string& s) {
-    static const int kInvalid = -1;
-    static int table[256];
-    static bool init = false;
-    if (!init) {
-        for (int i = 0; i < 256; ++i) table[i] = kInvalid;
+    constexpr int kInvalid = -1;
+    // Magic static: initialized exactly once, thread-safe even with several
+    // engine instances (= several engine threads) parsing headers at once.
+    static const std::array<int, 256> table = [] {
+        std::array<int, 256> t;
+        t.fill(-1);  // kInvalid (std::array::fill odr-uses its argument)
         const char* alpha =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i = 0; i < 64; ++i) table[static_cast<unsigned char>(alpha[i])] = i;
+        for (int i = 0; i < 64; ++i) t[static_cast<unsigned char>(alpha[i])] = i;
         // base64url variants -- some senders use them.
-        table[static_cast<unsigned char>('-')] = 62;
-        table[static_cast<unsigned char>('_')] = 63;
-        init = true;
-    }
+        t[static_cast<unsigned char>('-')] = 62;
+        t[static_cast<unsigned char>('_')] = 63;
+        return t;
+    }();
 
     std::string out;
     int buf = 0;
@@ -263,16 +265,6 @@ std::string toHexLower(const std::string& bytes) {
         out += d[c & 0xF];
     }
     return out;
-}
-
-bool isHexString(const std::string& s) {
-    if (s.empty()) return false;
-    for (char c : s) {
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-            return false;
-        }
-    }
-    return true;
 }
 
 // Normalize an algorithm name. RFC 3230 used "MD5" / "SHA" / "SHA-256";

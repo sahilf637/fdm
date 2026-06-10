@@ -47,6 +47,17 @@ ChunkTask::ChunkTask(std::string url, std::string outputPath, ChunkSpec spec,
         const std::string range = std::to_string(writeOffset) + "-" +
                                   std::to_string(spec_.endByte);
         curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
+    } else if (bytesWrittenSoFar_ > 0) {
+        // Open-ended resume (pause/retry/cross-restart of a download whose
+        // server didn't advertise ranges): still ask for the tail. If the
+        // server honors it (206) we continue where we stopped; if it ignores
+        // it (200, full body) the write callback restarts from offset 0 --
+        // without the Range request we'd write the body's first byte at
+        // offset bytesWrittenSoFar_ and corrupt the file.
+        const std::string range =
+            std::to_string(spec_.startByte + bytesWrittenSoFar_) + "-";
+        curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
+        openEndedResume_ = true;
     }
     curl_easy_setopt(easy_, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(easy_, CURLOPT_MAXREDIRS, 5L);
@@ -90,35 +101,6 @@ void ChunkTask::start(DownloadEngine& engine, std::function<void(CURLcode)> onCo
     engine.addEasy(easy_);
 }
 
-bool ChunkTask::prepareRetry() {
-    if (attempts_ >= kMaxAttempts) return false;
-    attempts_++;
-
-    const std::int64_t resumeStart = spec_.startByte + bytesWrittenSoFar_;
-    if (spec_.endByte >= 0) {
-        if (resumeStart > spec_.endByte) {
-            // We've already received everything; nothing left to retry.
-            return false;
-        }
-        const std::string range = std::to_string(resumeStart) + "-" +
-                                  std::to_string(spec_.endByte);
-        curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
-    }
-    // ctx_ (and thus CURLOPT_PRIVATE) is still valid; the same onDone fires.
-    return true;
-}
-
-bool ChunkTask::reconfigureForResume() {
-    const std::int64_t resumeStart = spec_.startByte + bytesWrittenSoFar_;
-    if (spec_.endByte >= 0) {
-        if (resumeStart > spec_.endByte) return false;
-        const std::string range = std::to_string(resumeStart) + "-" +
-                                  std::to_string(spec_.endByte);
-        curl_easy_setopt(easy_, CURLOPT_RANGE, range.c_str());
-    }
-    return true;
-}
-
 std::size_t ChunkTask::writeCallback(char* ptr, std::size_t size, std::size_t nmemb,
                                      void* userp) {
     auto* self = static_cast<ChunkTask*>(userp);
@@ -133,6 +115,16 @@ std::size_t ChunkTask::writeCallback(char* ptr, std::size_t size, std::size_t nm
         long http = 0;
         curl_easy_getinfo(self->easy_, CURLINFO_RESPONSE_CODE, &http);
         if (http == 200) return 0;
+    }
+
+    // First write of an open-ended resume: a 200 means the server ignored our
+    // Range request and is sending the full body, so restart writing from the
+    // segment's start instead of appending the body after the resumed bytes.
+    if (self->openEndedResume_) {
+        self->openEndedResume_ = false;
+        long http = 0;
+        curl_easy_getinfo(self->easy_, CURLINFO_RESPONSE_CODE, &http);
+        if (http == 200) self->bytesWrittenSoFar_ = 0;
     }
 
     // pwrite targets an absolute offset (chunk start + bytes already written),

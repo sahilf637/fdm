@@ -5,6 +5,7 @@ add_executable(fdm_tests
   test_chunk_task.cpp
   test_engine_local.cpp
   test_engine_retry.cpp
+  test_engine_resume.cpp
   test_engine_fallback.cpp
   test_engine_robustness.cpp
   test_engine_disposition.cpp

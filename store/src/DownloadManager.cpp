@@ -948,8 +948,19 @@ void DownloadManager::pause(qint64 id) {
     if (row->rec.kind == "video") {
         videoIntent_[id] = "pause";
         if (videoJobs_.contains(id)) { finishEngineVideo(id, false, "paused"); return; }
-        if (auto* p = videoProcs_.value(id, nullptr)) p->terminate();  // yt-dlp leaves .part
-        else videoIntent_.remove(id);  // nothing running to pause
+        if (auto* p = videoProcs_.value(id, nullptr)) {
+            p->terminate();  // yt-dlp leaves .part
+            return;
+        }
+        // No child running. The only other Active phase is the yt-dlp resolve,
+        // whose finished callback bails once the row is no longer Active --
+        // mark Paused so it does (resume() re-resolves from scratch).
+        videoIntent_.remove(id);
+        if (row->rec.status == DownloadStatus::Active) {
+            row->rec.status = DownloadStatus::Paused;
+            db_->updateDownloadStatus(id, DownloadStatus::Paused);
+            emit rowChanged(id);
+        }
         return;
     }
     if (row->engineId == 0) {
