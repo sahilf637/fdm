@@ -38,6 +38,12 @@ connections busy (segments 5 and 6 below are tails carved out of segment 2):
 - **Browser integration** — capture downloads from Chrome/Firefox, or use the
   right-click *Download with FDM*; cookies/referer/user-agent are forwarded so
   authenticated downloads work.
+- **Video & streaming downloads** — pick a quality from the in-page panel or
+  right-click a video; FDM extracts with **yt-dlp** and muxes with **ffmpeg**.
+  Direct http(s) streams ride the same multi-connection engine, and a plain
+  `.m3u8` can be saved with ffmpeg alone when yt-dlp isn't installed. See the
+  [optional dependencies](#optional-video-downloads) for Cloudflare-gated
+  streams.
 - **Per-segment progress UI**, single-instance GUI, and a scriptable CLI.
 
 ## Components
@@ -66,6 +72,27 @@ On Debian/Ubuntu:
 
 ```sh
 sudo apt install build-essential cmake libcurl4-openssl-dev qt6-base-dev
+```
+
+### Optional: video downloads
+
+Ordinary file downloads need nothing extra. Video/streaming downloads shell out
+to two external tools at runtime; FDM looks for them next to its binaries (e.g.
+`build/host/`) or on `PATH`:
+
+- **yt-dlp** — stream extraction (HLS/DASH and sites like YouTube).
+- **ffmpeg** — muxes separate audio/video tracks, and can save a plain `.m3u8`
+  by itself when yt-dlp is absent (`sudo apt install ffmpeg`).
+
+Some streams sit behind a Cloudflare anti-bot check and return `403`. yt-dlp can
+get past it by impersonating a browser's TLS fingerprint, which needs the
+optional **`curl_cffi`** backend. FDM only falls back to impersonation after a
+normal attempt fails, so it's never required — but for the pure-python yt-dlp
+(run by the system `python3`) you can enable it with:
+
+```sh
+python3 -m pip install --user --break-system-packages curl_cffi
+# verify: yt-dlp --list-impersonate-targets   (targets should not say "unavailable")
 ```
 
 ## Build

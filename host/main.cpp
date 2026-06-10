@@ -266,6 +266,52 @@ void failProbe(const QString& msg) {
     replyObjectAndExit(o, 1);
 }
 
+// A bare HLS/DASH manifest URL (vs. an ordinary web page). yt-dlp's generic
+// extractor reads these directly; a page URL may instead need to be scraped
+// with --force-generic-extractor when no site-specific extractor matches.
+bool looksLikeManifest(const QString& url) {
+    const QString path = QUrl(url).path().toLower();
+    return path.endsWith(QLatin1String(".m3u8")) || path.endsWith(QLatin1String(".mpd"));
+}
+
+// Run `yt-dlp -J` once for `url`. On success fills `info`; on failure fills
+// `errOut` with a short reason. `forceGeneric` adds --force-generic-extractor;
+// `impersonate` adds the curl_cffi browser-impersonation that defeats Cloudflare
+// TLS-fingerprint 403s (optional dependency, so only used as a last resort).
+bool runYtDlpJson(const QString& ytdlp, const QStringList& baseArgs, const QString& url,
+                  bool forceGeneric, bool impersonate, QJsonObject* info, QString* errOut) {
+    QStringList args = baseArgs;
+    if (forceGeneric) args << "--force-generic-extractor";
+    if (impersonate) args << "--extractor-args" << "generic:impersonate";
+    args << "--" << url;
+
+    QProcess proc;
+    proc.start(ytdlp, args);
+    if (!proc.waitForStarted(5000)) { *errOut = "could not start yt-dlp"; return false; }
+    if (!proc.waitForFinished(45000)) {
+        proc.kill();
+        *errOut = "yt-dlp timed out";
+        return false;
+    }
+    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
+        const QString err = QString::fromUtf8(proc.readAllStandardError()).trimmed();
+        *errOut = err.isEmpty() ? QStringLiteral("yt-dlp failed") : err.left(300);
+        return false;
+    }
+    const QJsonDocument doc = QJsonDocument::fromJson(proc.readAllStandardOutput().trimmed());
+    if (!doc.isObject()) { *errOut = "unparseable yt-dlp output"; return false; }
+    *info = doc.object();
+    return true;
+}
+
+// Friendlier nudge than yt-dlp's raw "Unsupported URL" when we handed it a page
+// URL (no manifest captured) and extraction found nothing playing yet.
+QString probeFailureMessage(bool manifest, const QString& raw) {
+    if (manifest) return raw.isEmpty() ? QStringLiteral("yt-dlp failed") : raw;
+    return QStringLiteral("No video found on this page. If it's playing, "
+                          "start playback and try again.");
+}
+
 // Run `yt-dlp -J` for `url` and reply with { ok, title, formats[] }. Stateless:
 // answers the browser directly without launching / touching the GUI.
 void runProbeVideo(const QString& url, const QJsonObject& headers) {
@@ -273,33 +319,33 @@ void runProbeVideo(const QString& url, const QJsonObject& headers) {
     const QString ytdlp = findYtDlp();
     if (ytdlp.isEmpty()) failProbe("yt-dlp not found");
 
-    QStringList args{"-J", "--no-warnings", "--no-playlist"};
+    QStringList baseArgs{"-J", "--no-warnings", "--no-playlist"};
     const QString ua = headers.value("User-Agent").toString();
-    if (!ua.isEmpty()) args << "--user-agent" << ua;
+    if (!ua.isEmpty()) baseArgs << "--user-agent" << ua;
     // Cookies are intentionally NOT forwarded: a logged-in YouTube session
     // forces the PO-token-gated web client, which returns no usable formats.
-    args << "--" << url;
 
-    QProcess proc;
-    proc.start(ytdlp, args);
-    if (!proc.waitForStarted(5000)) failProbe("could not start yt-dlp");
-    if (!proc.waitForFinished(45000)) {
-        proc.kill();
-        failProbe("yt-dlp timed out");
-    }
-    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-        const QString err = QString::fromUtf8(proc.readAllStandardError()).trimmed();
-        failProbe(err.isEmpty() ? QStringLiteral("yt-dlp failed") : err.left(300));
-    }
-    const QJsonDocument doc =
-        QJsonDocument::fromJson(proc.readAllStandardOutput().trimmed());
-    if (!doc.isObject()) failProbe("unparseable yt-dlp output");
+    const bool manifest = looksLikeManifest(url);
+    QJsonObject info;
+    QString err;
+    // Escalation ladder, cheapest first. A page the site-specific extractors
+    // don't recognize may still yield media when yt-dlp is forced to scrape it
+    // generically; a Cloudflare-gated generic request may need impersonation.
+    // We never force-generic a manifest URL (already generic) nor lead with
+    // impersonation (optional curl_cffi dep), so YouTube etc. keep their path.
+    bool ok = runYtDlpJson(ytdlp, baseArgs, url, /*forceGeneric=*/false, /*impersonate=*/false,
+                           &info, &err);
+    if (!ok && !manifest)
+        ok = runYtDlpJson(ytdlp, baseArgs, url, true, false, &info, &err);
+    if (!ok)
+        ok = runYtDlpJson(ytdlp, baseArgs, url, /*forceGeneric=*/!manifest, true, &info, &err);
+    if (!ok) failProbe(probeFailureMessage(manifest, err));
 
-    const QJsonObject info = doc.object();
     QJsonArray formats = curateFormats(info.value("formats").toArray());
     // Generic/direct media URLs describe their single stream at the top level.
     if (formats.isEmpty() && !info.value("url").toString().isEmpty())
         formats.append(singleFormatFromInfo(info));
+    if (formats.isEmpty()) failProbe(probeFailureMessage(manifest, "No downloadable formats found."));
 
     QJsonObject reply;
     reply.insert("ok", true);

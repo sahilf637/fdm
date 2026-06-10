@@ -18,6 +18,8 @@ class DownloadManager;
 
 namespace fdm_gui {
 
+class ElidedLabel;
+
 // One details window per download. Opened from MainWindow's "Details" action.
 // Subscribes to DownloadManager signals so the chunks table + summary stay
 // in sync without polling.
@@ -56,10 +58,13 @@ private:
     fdm::store::DownloadStatus lastStatus_ = fdm::store::DownloadStatus::Queued;
     bool lastStatusKnown_ = false;
 
-    QLabel* nameLabel_ = nullptr;
+    // Elided labels: a long, space-less URL/path/name would force a plain or
+    // word-wrapped QLabel as wide as the whole string, growing the window past
+    // the screen. ElidedLabel truncates with "…" to fit its width instead.
+    ElidedLabel* nameLabel_ = nullptr;
     QLabel* statusPill_ = nullptr;
-    QLabel* urlLabel_ = nullptr;
-    QLabel* pathLabel_ = nullptr;
+    ElidedLabel* urlLabel_ = nullptr;
+    ElidedLabel* pathLabel_ = nullptr;
     QLabel* sizeLabel_ = nullptr;     // received / total
     QLabel* statusLabel_ = nullptr;   // verification badge / error detail
     QLabel* speedLabel_ = nullptr;

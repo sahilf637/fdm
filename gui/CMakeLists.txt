@@ -9,6 +9,7 @@ add_executable(fdm-gui
   NewDownloadDialog.h
   DownloadDetailsWindow.cpp
   DownloadDetailsWindow.h
+  ElidedLabel.h
   SingleInstance.cpp
   SingleInstance.h
   fdm.qrc

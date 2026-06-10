@@ -14,6 +14,7 @@
 #include <QPointer>
 #include <QProcess>
 #include <QStandardPaths>
+#include <QUrl>
 #include <QtConcurrent>
 
 #include <memory>
@@ -49,6 +50,24 @@ QString findHelper(const QString& name) {
         if (fi.exists() && fi.isExecutable()) return fi.absoluteFilePath();
     }
     return QStandardPaths::findExecutable(name);
+}
+
+// A bare HLS/DASH manifest URL (vs. an ordinary web page). yt-dlp's generic
+// extractor reads these directly; a page URL may instead need scraping with
+// --force-generic-extractor, and a plain manifest can be pulled by ffmpeg alone.
+bool looksLikeManifest(const QString& url) {
+    const QString path = QUrl(url).path().toLower();
+    return path.endsWith(QLatin1String(".m3u8")) || path.endsWith(QLatin1String(".mpd"));
+}
+
+// yt-dlp extractor-escalation flags. `forceGeneric` scrapes a page the site
+// extractors can't read; `impersonate` uses curl_cffi to defeat Cloudflare
+// TLS-fingerprint 403s. Replayed at download time once one combination works.
+QStringList extractorEscalationArgs(bool forceGeneric, bool impersonate) {
+    QStringList args;
+    if (forceGeneric) args << "--force-generic-extractor";
+    if (impersonate) args << "--extractor-args" << "generic:impersonate";
+    return args;
 }
 
 // Strip path separators / control chars from a video title so it's safe as a
@@ -315,6 +334,9 @@ void DownloadManager::spawnVideo(qint64 id) {
             "%(progress.total_bytes_estimate)s|%(progress.speed)s"
          // Name by the video's real title (finishVideo adopts the actual path).
          << "-o" << QDir(dir).filePath("%(title)s.%(ext)s");
+    // Match the extractor escalation resolveVideo settled on (force-generic
+    // and/or impersonation), so the download extracts the same way it resolved.
+    args << videoExtraYtdlpArgs_.value(id);
     const QString ffmpeg = findHelper("ffmpeg");
     if (!ffmpeg.isEmpty()) args << "--ffmpeg-location" << ffmpeg;
     // Forward UA and any extra headers, but NOT cookies: a logged-in YouTube
@@ -358,6 +380,64 @@ void DownloadManager::spawnVideo(qint64 id) {
     emit rowChanged(id);
 
     proc->start(ytdlp, args);
+}
+
+void DownloadManager::spawnFfmpegHls(qint64 id) {
+    DownloadLiveRow* row = find(id);
+    if (!row) return;
+    const QString ffmpeg = findHelper("ffmpeg");
+    if (ffmpeg.isEmpty()) {
+        finishVideo(id, false, "neither yt-dlp nor ffmpeg found");
+        return;
+    }
+
+    // Replay UA / Referer so an access-gated manifest still loads.
+    QString ua, referer;
+    for (const std::string& h : headersFromJson(row->rec.requestHeaders)) {
+        const QString line = QString::fromStdString(h);
+        const int sep = line.indexOf(": ");
+        if (sep <= 0) continue;
+        const QString name = line.left(sep);
+        if (name.compare("User-Agent", Qt::CaseInsensitive) == 0) ua = line.mid(sep + 2);
+        else if (name.compare("Referer", Qt::CaseInsensitive) == 0) referer = line.mid(sep + 2);
+    }
+
+    QStringList args;
+    if (!ua.isEmpty()) args << "-user_agent" << ua;
+    if (!referer.isEmpty()) args << "-headers" << (QStringLiteral("Referer: ") + referer + "\r\n");
+    // Remux the segments into the container without re-encoding. The total size
+    // isn't known up front, so we report bytes-written progress only.
+    args << "-i" << row->rec.url << "-c" << "copy" << "-y"
+         << "-nostdin" << "-nostats" << "-progress" << "pipe:1"
+         << row->rec.outputPath;
+
+    auto* proc = new QProcess(this);
+    proc->setProcessChannelMode(QProcess::SeparateChannels);  // progress on stdout
+    videoProcs_.insert(id, proc);  // reuse the child registry for pause/cancel/finish
+    videoFinalPath_.remove(id);
+
+    connect(proc, &QProcess::readyReadStandardOutput, this, [this, id, proc]() {
+        while (proc->canReadLine()) {
+            const QString line = QString::fromUtf8(proc->readLine()).trimmed();
+            // ffmpeg -progress emits `key=value` lines; total_size is the running
+            // byte count of the output file.
+            if (!line.startsWith(QLatin1String("total_size="))) continue;
+            bool okNum = false;
+            const qint64 v = line.mid(QStringLiteral("total_size=").size()).toLongLong(&okNum);
+            DownloadLiveRow* r = find(id);
+            if (okNum && v >= 0 && r) { r->bytesReceived = v; emit rowChanged(id); }
+        }
+    });
+    connect(proc, &QProcess::finished, this, [this, id](int code, QProcess::ExitStatus st) {
+        const bool ok = st == QProcess::NormalExit && code == 0;
+        finishVideo(id, ok, ok ? QString() : QStringLiteral("ffmpeg could not save this stream"));
+    });
+
+    row->rec.status = DownloadStatus::Active;
+    row->rec.error.clear();
+    db_->updateDownloadStatus(id, DownloadStatus::Active);
+    emit rowChanged(id);
+    proc->start(ffmpeg, args);
 }
 
 void DownloadManager::onVideoLine(qint64 id, const QString& line) {
@@ -429,6 +509,7 @@ void DownloadManager::finishVideo(qint64 id, bool ok, const QString& error) {
         it.value()->deleteLater();
         videoProcs_.erase(it);
     }
+    videoExtraYtdlpArgs_.remove(id);
     DownloadLiveRow* row = find(id);
     if (!row) {  // removed while running
         videoIntent_.remove(id);
@@ -490,15 +571,24 @@ struct DownloadManager::VideoEngineJob {
 };
 
 void DownloadManager::resolveVideo(qint64 id) {
+    videoExtraYtdlpArgs_.remove(id);  // clear escalation flags from a prior attempt
+    resolveVideo(id, /*forceGeneric=*/false, /*impersonate=*/false);
+}
+
+void DownloadManager::resolveVideo(qint64 id, bool forceGeneric, bool impersonate) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
     const QString ytdlp = findHelper("yt-dlp");
     if (ytdlp.isEmpty()) {
+        // No yt-dlp: a plain (non-DRM) HLS/DASH manifest can still be pulled
+        // with ffmpeg alone. Anything else needs yt-dlp's extractors.
+        if (looksLikeManifest(row->rec.url)) { spawnFfmpegHls(id); return; }
         finishEngineVideo(id, false, "yt-dlp not found");
         return;
     }
     QStringList args;
     args << "-f" << row->rec.videoSelector << "-J" << "--no-playlist" << "--no-warnings";
+    args << extractorEscalationArgs(forceGeneric, impersonate);
     for (const std::string& h : headersFromJson(row->rec.requestHeaders)) {
         const QString line = QString::fromStdString(h);
         const int sep = line.indexOf(": ");
@@ -510,18 +600,33 @@ void DownloadManager::resolveVideo(qint64 id) {
     auto* proc = new QProcess(this);
     proc->setProcessChannelMode(QProcess::SeparateChannels);  // JSON on stdout
     connect(proc, &QProcess::finished, this,
-            [this, id, proc](int code, QProcess::ExitStatus st) {
+            [this, id, proc, forceGeneric, impersonate](int code, QProcess::ExitStatus st) {
                 const QByteArray out = proc->readAllStandardOutput();
                 const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
                 proc->deleteLater();
                 DownloadLiveRow* r = find(id);
                 if (!r || r->rec.status != DownloadStatus::Active) return;  // cancelled/removed
                 if (st != QProcess::NormalExit || code != 0) {
-                    finishEngineVideo(id, false,
-                                      err.isEmpty() ? QStringLiteral("could not read video")
-                                                    : err.left(300));
+                    const bool manifest = looksLikeManifest(r->rec.url);
+                    // Escalate cheapest-first: normal -> (page only) force-generic
+                    // -> impersonate (Cloudflare 403 rescue, optional dep) -> fail.
+                    if (!manifest && !forceGeneric && !impersonate) {
+                        resolveVideo(id, true, false);
+                        return;
+                    }
+                    if (!impersonate) {
+                        resolveVideo(id, !manifest, true);
+                        return;
+                    }
+                    finishEngineVideo(
+                        id, false,
+                        manifest ? (err.isEmpty() ? QStringLiteral("could not read video")
+                                                  : err.left(300))
+                                 : QStringLiteral("No video found on this page. If it's "
+                                                  "playing, start playback and try again."));
                     return;
                 }
+                videoExtraYtdlpArgs_[id] = extractorEscalationArgs(forceGeneric, impersonate);
                 handleResolved(id, out);
             });
     proc->start(ytdlp, args);
@@ -734,6 +839,7 @@ void DownloadManager::finishEngineVideo(qint64 id, bool ok, const QString& error
         videoJobs_.remove(id);
         delete job;
     }
+    videoExtraYtdlpArgs_.remove(id);
     DownloadLiveRow* row = find(id);
     if (!row) {
         videoIntent_.remove(id);
@@ -984,6 +1090,7 @@ void DownloadManager::remove(qint64 id, bool alsoRemoveFile) {
     }
     videoIntent_.remove(id);
     videoFinalPath_.remove(id);
+    videoExtraYtdlpArgs_.remove(id);
     const QString filePath = row->rec.outputPath;
     db_->deleteDownload(id);
     rows_.remove(id);

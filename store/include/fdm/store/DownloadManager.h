@@ -6,6 +6,7 @@
 #include <QPair>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QtGlobal>
 
 #include <functional>
@@ -148,6 +149,10 @@ private:
 
     // --- video (yt-dlp child process) path, used for segmented HLS/DASH ------
     void spawnVideo(qint64 id);                       // (re)launch the child
+    // Pull a plain (non-DRM) HLS/DASH manifest with ffmpeg alone (`-c copy`),
+    // used as a fallback when yt-dlp isn't installed. Reuses the videoProcs_
+    // registry so pause/cancel/finish route exactly like the yt-dlp child.
+    void spawnFfmpegHls(qint64 id);
     void onVideoLine(qint64 id, const QString& line); // parse one output line
     void finishVideo(qint64 id, bool ok, const QString& error);
     // Apply a pending pause/cancel intent to a finished video row. Returns true
@@ -161,6 +166,11 @@ private:
     // ffmpeg, while segmented streams fall back to the yt-dlp child above.
     struct VideoEngineJob;
     void resolveVideo(qint64 id);
+    // Escalation overload. `forceGeneric` adds --force-generic-extractor (retry a
+    // page URL the site extractors can't read); `impersonate` adds curl_cffi
+    // browser impersonation (last resort for Cloudflare 403s). Neither is used on
+    // the first try, so YouTube etc. keep their normal extractor path.
+    void resolveVideo(qint64 id, bool forceGeneric, bool impersonate);
     void handleResolved(qint64 id, const QByteArray& jsonOut);
     void startEngineStreams(qint64 id);
     void onVideoStreamEvent(qint64 id, int streamIdx, fdm::EngineEvent ev);
@@ -193,6 +203,10 @@ private:
     QHash<qint64, QString> videoIntent_;
     QHash<qint64, QString> videoFinalPath_;
     QHash<qint64, VideoEngineJob*> videoJobs_;  // engine-driven video downloads
+    // Extra yt-dlp args (e.g. --force-generic-extractor, impersonation) that
+    // succeeded at resolve time, replayed by the download child so it extracts
+    // the same way. Empty/absent for the common first-try-succeeds case.
+    QHash<qint64, QStringList> videoExtraYtdlpArgs_;
 };
 
 }  // namespace fdm::store

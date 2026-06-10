@@ -16,6 +16,7 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include "ElidedLabel.h"
 #include "MainWindow.h"
 #include "fdm/store/DownloadManager.h"
 
@@ -173,7 +174,7 @@ void DownloadDetailsWindow::buildUi() {
     const QString muted = mutedColor(this);
 
     // --- header: name + status pill -----------------------------------------
-    nameLabel_ = new QLabel;
+    nameLabel_ = new ElidedLabel;
     nameLabel_->setStyleSheet("color: palette(window-text); font-size: 15px; font-weight: 700;");
     statusPill_ = new QLabel;
     statusPill_->setAlignment(Qt::AlignCenter);
@@ -182,13 +183,9 @@ void DownloadDetailsWindow::buildUi() {
     headerRow->addWidget(nameLabel_, 1);
     headerRow->addWidget(statusPill_, 0, Qt::AlignRight | Qt::AlignVCenter);
 
-    urlLabel_ = new QLabel;
-    urlLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    urlLabel_->setWordWrap(true);
+    urlLabel_ = new ElidedLabel;
     urlLabel_->setStyleSheet(QString("color:%1;").arg(muted));
-    pathLabel_ = new QLabel;
-    pathLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    pathLabel_->setWordWrap(true);
+    pathLabel_ = new ElidedLabel;
     pathLabel_->setStyleSheet(QString("color:%1;").arg(muted));
 
     auto* divider = new QFrame;
@@ -209,8 +206,10 @@ void DownloadDetailsWindow::buildUi() {
     overallBar_->setFormat("%p%");
     overallBar_->setStyleSheet(barStyle(kAccent));
 
-    // Verification badge / error detail line.
+    // Verification badge / error detail line. Wrap long errors instead of
+    // stretching the window (error text contains spaces, so wrapping works).
     statusLabel_ = new QLabel;
+    statusLabel_->setWordWrap(true);
     statusLabel_->setStyleSheet(QString("color:%1; font-size: 12px;").arg(muted));
 
     chunkTable_ = new QTableWidget(0, kColCount);
@@ -282,14 +281,14 @@ void DownloadDetailsWindow::refresh() {
     const DownloadStatus st = row.rec.status;
     const bool active = st == DownloadStatus::Active;
 
-    nameLabel_->setText(QFileInfo(row.rec.outputPath).fileName());
+    nameLabel_->setFullText(QFileInfo(row.rec.outputPath).fileName());
     statusPill_->setText(statusText(st));
     statusPill_->setStyleSheet(
         QString("background:%1; color:white; border-radius:9px; padding:2px 12px;"
                 " font-size:12px; font-weight:600;")
             .arg(statusColor(st)));
-    urlLabel_->setText("URL: " + row.rec.url);
-    pathLabel_->setText("Path: " + row.rec.outputPath);
+    urlLabel_->setFullText("URL: " + row.rec.url);
+    pathLabel_->setFullText("Path: " + row.rec.outputPath);
 
     speedLabel_->setText(active ? humanRate(row.bytesPerSec) : "—");
 

@@ -266,9 +266,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.fdm === "probe") {
     (async () => {
+      const pageUrl = (sender.tab && sender.tab.url) || "";
       const url = probeTarget(sender.tab, msg.manifest);
       if (!isHttp(url)) return sendResponse({ ok: false, error: "no probeable URL" });
-      sendResponse(await sendToFdm({ type: "probe-video", url, headers: videoHeaders() }));
+      // Replay the page as Referer: many CDNs gate manifest/segment URLs on it.
+      sendResponse(await sendToFdm({ type: "probe-video", url, headers: videoHeaders(pageUrl) }));
     })();
     return true;  // async
   }
@@ -285,7 +287,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         formatId: msg.formatId || "",
         selector: msg.selector || "",
         title: msg.title || "",
-        headers: videoHeaders(),
+        headers: videoHeaders(pageUrl),
       }));
     })();
     return true;  // async
