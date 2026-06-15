@@ -79,6 +79,43 @@ QVariant DownloadListModel::data(const QModelIndex& index, int role) const {
     if (!opt) return {};
     const DownloadLiveRow& row = *opt;
 
+    switch (role) {
+        case IdRole:
+            return row.rec.id;
+        case NameRole: {
+            const QString name = QFileInfo(row.rec.outputPath).fileName();
+            return name.isEmpty() ? row.rec.outputPath : name;
+        }
+        case UrlRole:
+            return row.rec.url;
+        case OutputPathRole:
+            return row.rec.outputPath;
+        case StatusRole:
+            return static_cast<int>(row.rec.status);
+        case KindRole:
+            return row.rec.kind.isEmpty() ? QStringLiteral("http") : row.rec.kind;
+        case BytesReceivedRole:
+            return row.bytesReceived;
+        case TotalBytesRole:
+            return row.rec.totalBytes;
+        case SpeedRole:
+            return row.rec.status == DownloadStatus::Active ? row.bytesPerSec : 0.0;
+        case CreatedAtRole:
+            return row.rec.createdAt;
+        case UpdatedAtRole:
+            return row.rec.updatedAt;
+        case ErrorRole:
+            return row.rec.error;
+        case ActiveConnectionsRole:
+            return row.activeConnections;
+        case ConnectionLimitRole:
+            return row.connectionLimit;
+        case CanResumeRole:
+            return manager_->canResumeFromChunks(id);
+        default:
+            break;
+    }
+
     if (role == Qt::ToolTipRole) {
         if (index.column() == ColStatus && !row.rec.error.isEmpty()) {
             return row.rec.error;

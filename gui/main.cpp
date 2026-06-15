@@ -13,6 +13,7 @@
 
 #include "MainWindow.h"
 #include "SingleInstance.h"
+#include "Theme.h"
 #include "fdm/store/Database.h"
 #include "fdm/store/DownloadManager.h"
 
@@ -63,6 +64,8 @@ int main(int argc, char* argv[]) {
         icon.addFile(res);
     }
     app.setWindowIcon(icon);
+
+    fdm_gui::theme::apply(app);
 
     const QByteArray launchPayload = downloadRequestFromArgs(app.arguments());
 

@@ -110,7 +110,14 @@ public:
     // Engine-control operations. All are id-addressed and idempotent: e.g.
     // pause() of an already-paused download is a no-op.
     void pause(qint64 id);
-    void resume(qint64 id);   // continues a Paused download from saved chunks.
+    // Continues a Paused download from saved chunks. Also valid for a Failed
+    // download when canResumeFromChunks() is true: it picks up from the
+    // persisted chunk offsets instead of redownloading from byte zero.
+    void resume(qint64 id);
+    // True when a Failed download can continue where it stopped: the server
+    // supports ranges, we know the total size, and partial chunk state was
+    // persisted. (Video downloads re-resolve on retry instead.)
+    bool canResumeFromChunks(qint64 id) const;
     void cancel(qint64 id);
     // Restart from byte zero -- drops chunk progress, clears errors, calls
     // engine.start() fresh. Use when the prior attempt failed in a way

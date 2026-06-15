@@ -9,6 +9,12 @@ add_executable(fdm-gui
   NewDownloadDialog.h
   DownloadDetailsWindow.cpp
   DownloadDetailsWindow.h
+  DownloadItemDelegate.cpp
+  DownloadItemDelegate.h
+  Icons.cpp
+  Icons.h
+  Theme.cpp
+  Theme.h
   ElidedLabel.h
   SingleInstance.cpp
   SingleInstance.h

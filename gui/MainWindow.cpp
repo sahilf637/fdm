@@ -3,120 +3,271 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QDesktopServices>
+#include <QDragEnterEvent>
+#include <QDropEvent>
 #include <QFileInfo>
-#include <QHeaderView>
+#include <QMimeData>
+#include <QHBoxLayout>
 #include <QIcon>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeySequence>
+#include <QLabel>
+#include <QLineEdit>
+#include <QListView>
+#include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QStackedWidget>
 #include <QStandardPaths>
 #include <QStatusBar>
-#include <QStyle>
 #include <QSystemTrayIcon>
-#include <QTableView>
 #include <QToolBar>
+#include <QToolButton>
 #include <QUrl>
-#include <QVBoxLayout>
 
 #include "DownloadDetailsWindow.h"
+#include "DownloadItemDelegate.h"
+#include "Icons.h"
 #include "NewDownloadDialog.h"
+#include "fdm/store/DownloadFilterProxyModel.h"
 #include "fdm/store/DownloadListModel.h"
 #include "fdm/store/DownloadManager.h"
 
 namespace fdm_gui {
 
+using fdm::store::DownloadFilterProxyModel;
 using fdm::store::DownloadListModel;
 using fdm::store::DownloadManager;
 using fdm::store::DownloadStatus;
 
+using Category = DownloadFilterProxyModel::Category;
+
+namespace {
+
+QString humanRate(double bytesPerSec) {
+    constexpr double KiB = 1024.0;
+    constexpr double MiB = 1024.0 * KiB;
+    constexpr double GiB = 1024.0 * MiB;
+    if (bytesPerSec >= GiB) return QString::number(bytesPerSec / GiB, 'f', 2) + " GiB/s";
+    if (bytesPerSec >= MiB) return QString::number(bytesPerSec / MiB, 'f', 2) + " MiB/s";
+    if (bytesPerSec >= KiB) return QString::number(bytesPerSec / KiB, 'f', 1) + " KiB/s";
+    return QString::number(static_cast<qint64>(bytesPerSec)) + " B/s";
+}
+
+QString categoryLabel(Category c) {
+    switch (c) {
+        case Category::All:         return "All";
+        case Category::Downloading: return "Downloading";
+        case Category::Paused:      return "Paused";
+        case Category::Completed:   return "Completed";
+        case Category::Failed:      return "Failed";
+        case Category::Videos:      return "Videos";
+    }
+    return {};
+}
+
+bool isHttpUrl(const QString& text) {
+    const QUrl u(text);
+    return u.isValid() && (u.scheme() == "http" || u.scheme() == "https");
+}
+
+}  // namespace
+
 MainWindow::MainWindow(DownloadManager* manager, QWidget* parent)
     : QMainWindow(parent), manager_(manager) {
     setWindowTitle("Fresh Download Manager");
-    resize(1000, 520);
+    resize(1000, 560);
+    setAcceptDrops(true);
 
     buildUi();
-    buildToolbarAndMenu();
+    buildTopBarAndMenu();
     updateActionStates();
-    statusBar()->showMessage("Ready");
+    updateAggregates();
+
+    connect(manager_, &DownloadManager::rowAdded, this, &MainWindow::updateAggregates);
+    connect(manager_, &DownloadManager::rowChanged, this, &MainWindow::updateAggregates);
+    connect(manager_, &DownloadManager::rowRemoved, this, &MainWindow::updateAggregates);
+
+    // Completion notifications: seed with current statuses so rows restored
+    // from the DB don't fire, only genuine transitions do.
+    for (const auto& row : manager_->rows()) {
+        lastStatus_.insert(row.rec.id, static_cast<int>(row.rec.status));
+    }
+    connect(manager_, &DownloadManager::rowChanged, this,
+            &MainWindow::onRowChangedForNotify);
+    connect(manager_, &DownloadManager::rowRemoved, this,
+            [this](qint64 id) { lastStatus_.remove(id); });
+
+    // Land on whatever the user most likely cares about: live downloads if
+    // any survived the restart, the full list otherwise.
+    bool anyLive = false;
+    for (const auto& row : manager_->rows()) {
+        if (row.rec.status != DownloadStatus::Completed &&
+            row.rec.status != DownloadStatus::Failed) {
+            anyLive = true;
+            break;
+        }
+    }
+    sidebar_->setCurrentRow(anyLive ? 1 : 0);  // row order matches buildSidebar()
 }
 
 void MainWindow::buildUi() {
     model_ = new DownloadListModel(manager_, this);
+    proxy_ = new DownloadFilterProxyModel(this);
+    proxy_->setSourceModel(model_);
 
-    table_ = new QTableView;
-    table_->setModel(model_);
-    table_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    table_->setSelectionMode(QAbstractItemView::SingleSelection);
-    table_->setAlternatingRowColors(true);
-    table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    table_->verticalHeader()->setVisible(false);
-    table_->horizontalHeader()->setStretchLastSection(true);
-    table_->horizontalHeader()->setSectionResizeMode(DownloadListModel::ColName,
-                                                     QHeaderView::Interactive);
-    table_->setColumnWidth(DownloadListModel::ColName, 220);
-    table_->setColumnWidth(DownloadListModel::ColSize, 90);
-    table_->setColumnWidth(DownloadListModel::ColProgress, 80);
-    table_->setColumnWidth(DownloadListModel::ColSpeed, 90);
-    table_->setColumnWidth(DownloadListModel::ColStatus, 110);
+    list_ = new QListView;
+    list_->setObjectName("downloadList");
+    list_->setModel(proxy_);
+    list_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    list_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    list_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    list_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    // Hover feedback (row highlight + inline-button highlight in the
+    // delegate) needs move events even with no button down. Mouse events
+    // are delivered to the viewport, so tracking goes there.
+    list_->viewport()->setMouseTracking(true);
 
-    connect(table_->selectionModel(), &QItemSelectionModel::selectionChanged, this,
+    auto* delegate = new DownloadItemDelegate(list_);
+    list_->setItemDelegate(delegate);
+    // Clears the delegate's stale button-hover highlight when the cursor
+    // leaves the rows (editorEvent only fires while over an item).
+    list_->viewport()->installEventFilter(delegate);
+    connect(delegate, &DownloadItemDelegate::actionTriggered, this,
+            [this](qint64 id, DownloadItemDelegate::RowAction action) {
+                using RowAction = DownloadItemDelegate::RowAction;
+                switch (action) {
+                    case RowAction::Pause:      manager_->pause(id); break;
+                    case RowAction::Resume:     manager_->resume(id); break;
+                    case RowAction::Cancel:     manager_->cancel(id); break;
+                    case RowAction::Retry:      manager_->retry(id); break;
+                    case RowAction::OpenFolder: openFolderFor(id); break;
+                }
+            });
+
+    connect(list_->selectionModel(), &QItemSelectionModel::selectionChanged, this,
             &MainWindow::onSelectionChanged);
-    connect(table_, &QTableView::doubleClicked, this, &MainWindow::onRowDoubleClicked);
+    connect(list_, &QListView::doubleClicked, this, &MainWindow::onRowDoubleClicked);
 
-    table_->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(table_, &QTableView::customContextMenuRequested, this,
+    list_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(list_, &QListView::customContextMenuRequested, this,
             &MainWindow::onTableContextMenu);
 
-    setCentralWidget(table_);
+    emptyLabel_ = new QLabel;
+    emptyLabel_->setAlignment(Qt::AlignCenter);
+    emptyLabel_->setStyleSheet("color: palette(mid); font-size: 14px;");
+
+    stack_ = new QStackedWidget;
+    stack_->addWidget(list_);        // page 0
+    stack_->addWidget(emptyLabel_);  // page 1
+
+    buildSidebar();
+
+    auto* central = new QWidget;
+    auto* layout = new QHBoxLayout(central);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    layout->addWidget(sidebar_);
+    layout->addWidget(stack_, 1);
+    setCentralWidget(central);
+
+    statsLabel_ = new QLabel;
+    statusBar()->addPermanentWidget(statsLabel_);
 }
 
-void MainWindow::buildToolbarAndMenu() {
-    newAction_ = new QAction(style()->standardIcon(QStyle::SP_FileDialogNewFolder),
-                             "&New Download", this);
+void MainWindow::buildSidebar() {
+    sidebar_ = new QListWidget;
+    sidebar_->setObjectName("sidebar");
+    sidebar_->setFixedWidth(170);
+    sidebar_->setSelectionMode(QAbstractItemView::SingleSelection);
+
+    // Row order matters: the constructor selects row 1 ("Downloading") when
+    // live downloads exist.
+    const Category cats[] = {Category::All,       Category::Downloading,
+                             Category::Paused,    Category::Completed,
+                             Category::Failed,    Category::Videos};
+    for (Category c : cats) {
+        auto* item = new QListWidgetItem(categoryLabel(c), sidebar_);
+        item->setData(Qt::UserRole, static_cast<int>(c));
+    }
+
+    connect(sidebar_, &QListWidget::currentRowChanged, this,
+            &MainWindow::onCategoryChanged);
+}
+
+void MainWindow::buildTopBarAndMenu() {
+    using icons::Glyph;
+    newAction_ = new QAction(icons::icon(Glyph::Add), "&Add download…", this);
     newAction_->setShortcut(QKeySequence::New);
     connect(newAction_, &QAction::triggered, this, &MainWindow::onNewDownloadClicked);
 
-    pauseAction_ = new QAction(style()->standardIcon(QStyle::SP_MediaPause), "&Pause", this);
+    addClipboardAction_ = new QAction("Add from &clipboard", this);
+    addClipboardAction_->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
+    connect(addClipboardAction_, &QAction::triggered, this,
+            &MainWindow::onAddFromClipboard);
+
+    addVideoAction_ = new QAction(icons::icon(Glyph::Video), "Add &video…", this);
+    connect(addVideoAction_, &QAction::triggered, this, &MainWindow::onAddVideoClicked);
+
+    pauseAction_ = new QAction(icons::icon(Glyph::Pause), "&Pause", this);
     connect(pauseAction_, &QAction::triggered, this, &MainWindow::onPauseClicked);
 
-    resumeAction_ = new QAction(style()->standardIcon(QStyle::SP_MediaPlay), "&Resume", this);
+    resumeAction_ = new QAction(icons::icon(Glyph::Play), "&Resume", this);
     connect(resumeAction_, &QAction::triggered, this, &MainWindow::onResumeClicked);
 
-    cancelAction_ = new QAction(style()->standardIcon(QStyle::SP_MediaStop), "&Cancel", this);
+    cancelAction_ = new QAction(icons::icon(Glyph::Cancel), "&Cancel", this);
     connect(cancelAction_, &QAction::triggered, this, &MainWindow::onCancelClicked);
 
-    retryAction_ = new QAction(style()->standardIcon(QStyle::SP_BrowserReload),
-                               "Re&try", this);
+    retryAction_ = new QAction(icons::icon(Glyph::Retry), "Re&try", this);
     connect(retryAction_, &QAction::triggered, this, &MainWindow::onRetryClicked);
 
-    redownloadAction_ = new QAction(style()->standardIcon(QStyle::SP_DialogSaveButton),
-                                    "Re&download…", this);
+    redownloadAction_ = new QAction(icons::icon(Glyph::Redownload), "Re&download…", this);
     connect(redownloadAction_, &QAction::triggered, this, &MainWindow::onRedownloadClicked);
 
-    removeAction_ = new QAction(style()->standardIcon(QStyle::SP_TrashIcon),
-                                "Re&move from list", this);
+    removeAction_ = new QAction(icons::icon(Glyph::Trash), "Re&move from list", this);
+    removeAction_->setShortcut(QKeySequence::Delete);
+    // Widget-scoped so the Delete key still edits text in the search box;
+    // it only removes rows while the list itself has focus.
+    removeAction_->setShortcutContext(Qt::WidgetShortcut);
+    list_->addAction(removeAction_);
     connect(removeAction_, &QAction::triggered, this, &MainWindow::onRemoveClicked);
 
-    openFolderAction_ = new QAction(style()->standardIcon(QStyle::SP_DirOpenIcon),
-                                    "Open &folder", this);
+    openFolderAction_ = new QAction(icons::icon(Glyph::Folder), "Open &folder", this);
     connect(openFolderAction_, &QAction::triggered, this, &MainWindow::onOpenFolderClicked);
 
-    detailsAction_ = new QAction(style()->standardIcon(QStyle::SP_FileDialogDetailedView),
-                                 "Show &details", this);
+    detailsAction_ = new QAction(icons::icon(Glyph::Details), "Show &details", this);
     detailsAction_->setShortcut(Qt::CTRL | Qt::Key_D);
     connect(detailsAction_, &QAction::triggered, this, &MainWindow::onDetailsClicked);
 
-    auto* fileMenu = menuBar()->addMenu("&File");
-    fileMenu->addAction(newAction_);
-    fileMenu->addSeparator();
-    auto* quitAction = fileMenu->addAction("&Quit");
+    pauseAllAction_ = new QAction(icons::icon(Glyph::Pause), "Pause a&ll", this);
+    connect(pauseAllAction_, &QAction::triggered, this, &MainWindow::onPauseAllClicked);
+
+    resumeAllAction_ = new QAction(icons::icon(Glyph::Play), "Resume al&l", this);
+    connect(resumeAllAction_, &QAction::triggered, this, &MainWindow::onResumeAllClicked);
+
+    removeCompletedAction_ = new QAction("Remove completed from list", this);
+    connect(removeCompletedAction_, &QAction::triggered, this,
+            &MainWindow::onRemoveCompletedClicked);
+
+    auto* updateBackendAction = new QAction("&Update video downloader (yt-dlp)", this);
+    connect(updateBackendAction, &QAction::triggered, this, &MainWindow::onUpdateYtDlp);
+
+    auto* quitAction = new QAction("&Quit", this);
     quitAction->setShortcut(QKeySequence::Quit);
     connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
+
+    // --- menu bar (keyboard/discoverability mirror of everything) ---------
+    auto* fileMenu = menuBar()->addMenu("&File");
+    fileMenu->addAction(newAction_);
+    fileMenu->addAction(addClipboardAction_);
+    fileMenu->addAction(addVideoAction_);
+    fileMenu->addSeparator();
+    fileMenu->addAction(quitAction);
 
     auto* dlMenu = menuBar()->addMenu("&Download");
     dlMenu->addAction(pauseAction_);
@@ -130,25 +281,73 @@ void MainWindow::buildToolbarAndMenu() {
     dlMenu->addAction(openFolderAction_);
     dlMenu->addSeparator();
     dlMenu->addAction(removeAction_);
+    dlMenu->addSeparator();
+    dlMenu->addAction(pauseAllAction_);
+    dlMenu->addAction(resumeAllAction_);
+    dlMenu->addAction(removeCompletedAction_);
 
     auto* toolsMenu = menuBar()->addMenu("&Tools");
-    auto* updateBackend = toolsMenu->addAction("&Update video downloader (yt-dlp)");
-    connect(updateBackend, &QAction::triggered, this, &MainWindow::onUpdateYtDlp);
+    toolsMenu->addAction(updateBackendAction);
 
+    // --- top bar: Add ▾ | pause/resume all | …spacer… | search | overflow --
     auto* toolbar = addToolBar("Main");
+    toolbar->setObjectName("topBar");
     toolbar->setMovable(false);
     toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    toolbar->addAction(newAction_);
+
+    auto* addButton = new QToolButton;
+    addButton->setDefaultAction(newAction_);
+    addButton->setPopupMode(QToolButton::MenuButtonPopup);
+    addButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    auto* addMenu = new QMenu(addButton);
+    addMenu->addAction(addClipboardAction_);
+    addMenu->addAction(addVideoAction_);
+    addButton->setMenu(addMenu);
+    toolbar->addWidget(addButton);
+
     toolbar->addSeparator();
-    toolbar->addAction(pauseAction_);
-    toolbar->addAction(resumeAction_);
-    toolbar->addAction(cancelAction_);
-    toolbar->addAction(retryAction_);
-    toolbar->addAction(redownloadAction_);
-    toolbar->addSeparator();
-    toolbar->addAction(detailsAction_);
-    toolbar->addAction(openFolderAction_);
-    toolbar->addAction(removeAction_);
+    toolbar->addAction(pauseAllAction_);
+    toolbar->addAction(resumeAllAction_);
+
+    auto* spacer = new QWidget;
+    spacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    toolbar->addWidget(spacer);
+
+    searchEdit_ = new QLineEdit;
+    searchEdit_->setObjectName("searchBox");
+    searchEdit_->setPlaceholderText("Search name or URL  (Ctrl+F)");
+    searchEdit_->setClearButtonEnabled(true);
+    searchEdit_->setFixedWidth(240);
+    connect(searchEdit_, &QLineEdit::textChanged, this,
+            &MainWindow::onSearchTextChanged);
+    toolbar->addWidget(searchEdit_);
+
+    // Ctrl+V while the list has focus = "add from clipboard". Widget-scoped
+    // so pasting into the search box keeps its normal meaning.
+    auto* pasteAdd = new QAction(this);
+    pasteAdd->setShortcut(QKeySequence::Paste);
+    pasteAdd->setShortcutContext(Qt::WidgetShortcut);
+    connect(pasteAdd, &QAction::triggered, this, &MainWindow::onAddFromClipboard);
+    list_->addAction(pasteAdd);
+
+    auto* focusSearch = new QAction(this);
+    focusSearch->setShortcut(QKeySequence::Find);
+    connect(focusSearch, &QAction::triggered, this, [this]() {
+        searchEdit_->setFocus();
+        searchEdit_->selectAll();
+    });
+    addAction(focusSearch);
+
+    auto* overflowButton = new QToolButton;
+    overflowButton->setIcon(icons::icon(Glyph::Dots));
+    overflowButton->setPopupMode(QToolButton::InstantPopup);
+    auto* overflowMenu = new QMenu(overflowButton);
+    overflowMenu->addAction(removeCompletedAction_);
+    overflowMenu->addAction(updateBackendAction);
+    overflowMenu->addSeparator();
+    overflowMenu->addAction(quitAction);
+    overflowButton->setMenu(overflowMenu);
+    toolbar->addWidget(overflowButton);
 }
 
 void MainWindow::installTray() {
@@ -178,55 +377,213 @@ void MainWindow::installTray() {
                     activateWindow();
                 }
             });
+    // Clicking the "Download complete" balloon reveals the file.
+    connect(tray_, &QSystemTrayIcon::messageClicked, this, [this]() {
+        if (lastCompletedPath_.isEmpty()) return;
+        QDesktopServices::openUrl(QUrl::fromLocalFile(
+            QFileInfo(lastCompletedPath_).absolutePath()));
+    });
     tray_->show();
 }
 
 qint64 MainWindow::currentDownloadId() const {
-    const QModelIndexList selection = table_->selectionModel()->selectedRows();
-    if (selection.isEmpty()) return 0;
-    return model_->idForRow(selection.first().row());
+    const QList<qint64> ids = selectedDownloadIds();
+    return ids.isEmpty() ? 0 : ids.first();
+}
+
+QList<qint64> MainWindow::selectedDownloadIds() const {
+    QList<qint64> ids;
+    for (const QModelIndex& idx : list_->selectionModel()->selectedRows()) {
+        const qint64 id = proxy_->idForRow(idx.row());
+        if (id != 0) ids.append(id);
+    }
+    return ids;
+}
+
+void MainWindow::selectProxyRow(int proxyRow) {
+    const QModelIndex idx = proxy_->index(proxyRow, 0);
+    list_->selectionModel()->select(
+        idx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    list_->setCurrentIndex(idx);
+}
+
+void MainWindow::selectRowById(qint64 id) {
+    for (int row = 0; row < proxy_->rowCount(); ++row) {
+        if (proxy_->idForRow(row) == id) {
+            selectProxyRow(row);
+            return;
+        }
+    }
+}
+
+void MainWindow::showNewDownload(qint64 id) {
+    // A just-started download is Queued/Active, so the Downloading category
+    // is guaranteed to show it even if the user was browsing history.
+    const Category current = proxy_->category();
+    if (current != Category::All && current != Category::Downloading) {
+        for (int row = 0; row < sidebar_->count(); ++row) {
+            const auto cat = static_cast<Category>(
+                sidebar_->item(row)->data(Qt::UserRole).toInt());
+            if (cat == Category::Downloading) {
+                sidebar_->setCurrentRow(row);
+                break;
+            }
+        }
+    }
+    selectRowById(id);
 }
 
 void MainWindow::updateActionStates() {
-    const qint64 id = currentDownloadId();
-    if (id == 0) {
-        pauseAction_->setEnabled(false);
-        resumeAction_->setEnabled(false);
-        cancelAction_->setEnabled(false);
-        retryAction_->setEnabled(false);
-        redownloadAction_->setEnabled(false);
-        removeAction_->setEnabled(false);
-        openFolderAction_->setEnabled(false);
-        detailsAction_->setEnabled(false);
-        return;
+    bool anyActive = false;
+    bool anyPaused = false;
+    bool anyResumable = false;
+    bool anyFailed = false;
+    const QList<qint64> ids = selectedDownloadIds();
+    for (qint64 id : ids) {
+        const auto row = manager_->row(id);
+        if (!row) continue;
+        anyActive |= row->rec.status == DownloadStatus::Active;
+        anyPaused |= row->rec.status == DownloadStatus::Paused;
+        // Paused rows resume; so do failed rows with resumable chunk state.
+        anyResumable |= row->rec.status == DownloadStatus::Paused ||
+                        manager_->canResumeFromChunks(id);
+        anyFailed |= row->rec.status == DownloadStatus::Failed;
     }
-    const auto row = manager_->row(id);
-    if (!row) return;
-    const bool active = row->rec.status == DownloadStatus::Active;
-    const bool paused = row->rec.status == DownloadStatus::Paused;
-    const bool failed = row->rec.status == DownloadStatus::Failed;
-    const bool completed = row->rec.status == DownloadStatus::Completed;
-    pauseAction_->setEnabled(active);
-    resumeAction_->setEnabled(paused);
-    cancelAction_->setEnabled(active || paused);
-    retryAction_->setEnabled(failed);
-    redownloadAction_->setEnabled(failed || completed);
-    removeAction_->setEnabled(true);
-    openFolderAction_->setEnabled(true);
-    detailsAction_->setEnabled(true);
+    const bool single = ids.size() == 1;
+    bool singleFinished = false;
+    if (single) {
+        const auto row = manager_->row(ids.first());
+        singleFinished = row && (row->rec.status == DownloadStatus::Failed ||
+                                 row->rec.status == DownloadStatus::Completed);
+    }
+
+    pauseAction_->setEnabled(anyActive);
+    resumeAction_->setEnabled(anyResumable);
+    cancelAction_->setEnabled(anyActive || anyPaused);
+    retryAction_->setEnabled(anyFailed);
+    redownloadAction_->setEnabled(singleFinished);
+    removeAction_->setEnabled(!ids.isEmpty());
+    openFolderAction_->setEnabled(single);
+    detailsAction_->setEnabled(single);
+}
+
+void MainWindow::updateAggregates() {
+    int total = 0, downloading = 0, paused = 0, completed = 0, failed = 0, videos = 0;
+    double totalSpeed = 0.0;
+    for (const auto& row : manager_->rows()) {
+        ++total;
+        switch (row.rec.status) {
+            case DownloadStatus::Queued:
+            case DownloadStatus::Active:
+            case DownloadStatus::Finalizing:
+                ++downloading;
+                break;
+            case DownloadStatus::Paused:    ++paused;    break;
+            case DownloadStatus::Completed: ++completed; break;
+            case DownloadStatus::Failed:    ++failed;    break;
+        }
+        if (row.rec.status == DownloadStatus::Active) totalSpeed += row.bytesPerSec;
+        if (row.rec.kind == "video") ++videos;
+    }
+
+    for (int i = 0; i < sidebar_->count(); ++i) {
+        QListWidgetItem* item = sidebar_->item(i);
+        const auto cat = static_cast<Category>(item->data(Qt::UserRole).toInt());
+        int count = 0;
+        switch (cat) {
+            case Category::All:         count = total;       break;
+            case Category::Downloading: count = downloading; break;
+            case Category::Paused:      count = paused;      break;
+            case Category::Completed:   count = completed;   break;
+            case Category::Failed:      count = failed;      break;
+            case Category::Videos:      count = videos;      break;
+        }
+        item->setText(QString("%1  (%2)").arg(categoryLabel(cat)).arg(count));
+    }
+
+    if (downloading > 0 && totalSpeed > 0) {
+        statsLabel_->setText(QString("↓ %1 · %2 active")
+                                 .arg(humanRate(totalSpeed))
+                                 .arg(downloading));
+    } else if (downloading > 0) {
+        statsLabel_->setText(QString("%1 active").arg(downloading));
+    } else {
+        statsLabel_->setText(total == 0 ? QString("No downloads")
+                                        : QString("%1 downloads").arg(total));
+    }
+
+    if (proxy_->rowCount() == 0) {
+        if (total == 0) {
+            emptyLabel_->setText(
+                "No downloads yet\nPress Ctrl+N, or copy a link and use Add ▾");
+        } else if (!searchEdit_->text().trimmed().isEmpty()) {
+            emptyLabel_->setText("No downloads match your search");
+        } else {
+            emptyLabel_->setText("Nothing in this category");
+        }
+        stack_->setCurrentIndex(1);
+    } else {
+        stack_->setCurrentIndex(0);
+    }
 }
 
 void MainWindow::onSelectionChanged() {
     updateActionStates();
 }
 
-void MainWindow::onRowDoubleClicked(const QModelIndex& index) {
-    const qint64 id = model_->idForRow(index.row());
-    if (id != 0) openDetailsFor(id);
+void MainWindow::onCategoryChanged() {
+    QListWidgetItem* item = sidebar_->currentItem();
+    if (!item) return;
+    proxy_->setCategory(static_cast<Category>(item->data(Qt::UserRole).toInt()));
+    updateAggregates();
+    updateActionStates();
 }
 
-void MainWindow::onNewDownloadClicked() {
+void MainWindow::onSearchTextChanged(const QString& text) {
+    proxy_->setSearchText(text);
+    updateAggregates();
+    updateActionStates();
+}
+
+void MainWindow::onRowDoubleClicked(const QModelIndex& index) {
+    const qint64 id = proxy_->idForRow(index.row());
+    if (id == 0) return;
+    // Double-clicking a finished file opens it; anything else opens the
+    // live details window.
+    const auto row = manager_->row(id);
+    if (row && row->rec.status == DownloadStatus::Completed) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(row->rec.outputPath));
+        return;
+    }
+    openDetailsFor(id);
+}
+
+void MainWindow::onRowChangedForNotify(qint64 id) {
+    const auto row = manager_->row(id);
+    if (!row) return;
+    const int status = static_cast<int>(row->rec.status);
+    const int previous = lastStatus_.value(id, -1);
+    lastStatus_.insert(id, status);
+    if (previous == status ||
+        row->rec.status != DownloadStatus::Completed ||
+        previous == -1) {
+        return;
+    }
+
+    lastCompletedPath_ = row->rec.outputPath;
+    const QString name = QFileInfo(row->rec.outputPath).fileName();
+    statusBar()->showMessage(QString("Completed %1").arg(name), 6000);
+    if (tray_) {
+        tray_->showMessage("Download complete", name,
+                           QSystemTrayIcon::Information, 6000);
+    }
+}
+
+void MainWindow::addDownloadWithDialog(const QString& prefillUrl) {
     NewDownloadDialog dlg(manager_, this);
+    if (!prefillUrl.isEmpty()) {
+        dlg.prefill(prefillUrl, QString(), QString());
+    }
     if (dlg.exec() != QDialog::Accepted) return;
     const QString url = dlg.url();
     const QString path = dlg.outputPath();
@@ -236,31 +593,139 @@ void MainWindow::onNewDownloadClicked() {
         manager_->startNew(url, path, dlg.userHash(), dlg.userHashAlgorithm());
     statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()),
                              4000);
-    // Select the new row so action states update without an extra click.
-    const int row = model_->rowCount() - 1;
-    if (row >= 0 && model_->idForRow(row) == id) {
-        table_->selectRow(row);
+    showNewDownload(id);
+}
+
+void MainWindow::onNewDownloadClicked() {
+    addDownloadWithDialog(QString());
+}
+
+void MainWindow::onAddFromClipboard() {
+    const QString text = QApplication::clipboard()->text().trimmed();
+    addDownloadWithDialog(isHttpUrl(text) ? text : QString());
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event) {
+    const QMimeData* mime = event->mimeData();
+    if (mime->hasUrls()) {
+        for (const QUrl& u : mime->urls()) {
+            if (u.scheme() == "http" || u.scheme() == "https") {
+                event->acceptProposedAction();
+                return;
+            }
+        }
+    }
+    if (mime->hasText() && isHttpUrl(mime->text().trimmed())) {
+        event->acceptProposedAction();
     }
 }
 
+void MainWindow::dropEvent(QDropEvent* event) {
+    const QMimeData* mime = event->mimeData();
+    QString url;
+    if (mime->hasUrls()) {
+        for (const QUrl& u : mime->urls()) {
+            if (u.scheme() == "http" || u.scheme() == "https") {
+                url = u.toString();
+                break;
+            }
+        }
+    }
+    if (url.isEmpty() && mime->hasText() && isHttpUrl(mime->text().trimmed())) {
+        url = mime->text().trimmed();
+    }
+    if (url.isEmpty()) return;
+    event->acceptProposedAction();
+    addDownloadWithDialog(url);
+}
+
+void MainWindow::onAddVideoClicked() {
+    NewDownloadDialog dlg(manager_, this);
+    dlg.setVideoMode(/*urlEditable=*/true);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString url = dlg.url();
+    const QString path = dlg.outputPath();
+    if (url.isEmpty() || path.isEmpty()) return;
+
+    const QFileInfo fi(path);
+    // Empty selector lets yt-dlp pick its default (best) format.
+    const qint64 id = manager_->startVideo(url, QString(), fi.completeBaseName(),
+                                           fi.absolutePath(), {});
+    statusBar()->showMessage(
+        QString("Downloading video: %1").arg(fi.completeBaseName()), 4000);
+    showNewDownload(id);
+}
+
 void MainWindow::onPauseClicked() {
-    const qint64 id = currentDownloadId();
-    if (id != 0) manager_->pause(id);
+    for (qint64 id : selectedDownloadIds()) {
+        const auto row = manager_->row(id);
+        if (row && row->rec.status == DownloadStatus::Active) manager_->pause(id);
+    }
 }
 
 void MainWindow::onResumeClicked() {
-    const qint64 id = currentDownloadId();
-    if (id != 0) manager_->resume(id);
+    for (qint64 id : selectedDownloadIds()) {
+        const auto row = manager_->row(id);
+        if (row && (row->rec.status == DownloadStatus::Paused ||
+                    manager_->canResumeFromChunks(id)))
+            manager_->resume(id);
+    }
 }
 
 void MainWindow::onCancelClicked() {
-    const qint64 id = currentDownloadId();
-    if (id != 0) manager_->cancel(id);
+    for (qint64 id : selectedDownloadIds()) {
+        const auto row = manager_->row(id);
+        if (row && (row->rec.status == DownloadStatus::Active ||
+                    row->rec.status == DownloadStatus::Paused)) {
+            manager_->cancel(id);
+        }
+    }
 }
 
 void MainWindow::onRetryClicked() {
-    const qint64 id = currentDownloadId();
-    if (id != 0) manager_->retry(id);
+    for (qint64 id : selectedDownloadIds()) {
+        const auto row = manager_->row(id);
+        if (row && row->rec.status == DownloadStatus::Failed) manager_->retry(id);
+    }
+}
+
+void MainWindow::onPauseAllClicked() {
+    for (const auto& row : manager_->rows()) {
+        if (row.rec.status == DownloadStatus::Active) manager_->pause(row.rec.id);
+    }
+}
+
+void MainWindow::onResumeAllClicked() {
+    for (const auto& row : manager_->rows()) {
+        if (row.rec.status == DownloadStatus::Paused) manager_->resume(row.rec.id);
+    }
+}
+
+void MainWindow::onRemoveCompletedClicked() {
+    QList<qint64> ids;
+    for (const auto& row : manager_->rows()) {
+        if (row.rec.status == DownloadStatus::Completed) ids.append(row.rec.id);
+    }
+    if (ids.isEmpty()) {
+        statusBar()->showMessage("No completed downloads to remove", 4000);
+        return;
+    }
+
+    QMessageBox box(this);
+    box.setIcon(QMessageBox::Question);
+    box.setWindowTitle("Remove completed");
+    box.setText(QString("Remove %1 completed download%2 from the list?\n"
+                        "Files on disk are kept.")
+                    .arg(ids.size())
+                    .arg(ids.size() == 1 ? "" : "s"));
+    QAbstractButton* removeBtn = box.addButton("Remove", QMessageBox::AcceptRole);
+    QAbstractButton* cancelBtn = box.addButton("Cancel", QMessageBox::RejectRole);
+    cancelBtn->setIcon(QIcon());
+    removeBtn->setIcon(QIcon());
+    box.exec();
+    if (box.clickedButton() != removeBtn) return;
+
+    for (qint64 id : ids) manager_->remove(id, /*alsoRemoveFile=*/false);
 }
 
 void MainWindow::onRedownloadClicked() {
@@ -285,10 +750,7 @@ void MainWindow::redownloadFromRow(qint64 id) {
     const qint64 newId =
         manager_->startNew(url, path, dlg.userHash(), dlg.userHashAlgorithm());
     statusBar()->showMessage(QString("Started %1").arg(QFileInfo(path).fileName()), 4000);
-    const int newRow = model_->rowCount() - 1;
-    if (newRow >= 0 && model_->idForRow(newRow) == newId) {
-        table_->selectRow(newRow);
-    }
+    showNewDownload(newId);
     // Pop a details window for the restart -- this path also fires from a
     // details window's "Redownload…" button while the main list is hidden.
     openDetailsFor(newId);
@@ -296,8 +758,7 @@ void MainWindow::redownloadFromRow(qint64 id) {
 
 void MainWindow::openExternalDownload(const ExternalDownloadRequest& req) {
     if (req.url.isEmpty()) return;
-    const QUrl u(req.url);
-    if (u.scheme() != "http" && u.scheme() != "https") return;
+    if (!isHttpUrl(req.url)) return;
 
     // Stand-alone dialog (parent nullptr): for a browser-triggered download the
     // main list stays hidden in the tray, so the dialog -- and the details
@@ -390,18 +851,27 @@ void MainWindow::handleIpcMessage(const QByteArray& payload) {
 }
 
 void MainWindow::onRemoveClicked() {
-    const qint64 id = currentDownloadId();
-    if (id == 0) return;
-    const auto row = manager_->row(id);
-    if (!row) return;
+    const QList<qint64> ids = selectedDownloadIds();
+    if (ids.isEmpty()) return;
+
+    QString text;
+    if (ids.size() == 1) {
+        const auto row = manager_->row(ids.first());
+        if (!row) return;
+        text = QString("Remove '%1' from the list?")
+                   .arg(QFileInfo(row->rec.outputPath).fileName());
+    } else {
+        text = QString("Remove %1 downloads from the list?").arg(ids.size());
+    }
 
     QMessageBox box(this);
     box.setIcon(QMessageBox::Question);
     box.setWindowTitle("Remove download");
-    box.setText(QString("Remove '%1' from the list?")
-                    .arg(QFileInfo(row->rec.outputPath).fileName()));
+    box.setText(text);
 
-    auto* alsoDeleteFile = new QCheckBox("Also delete the downloaded file");
+    auto* alsoDeleteFile = new QCheckBox(
+        ids.size() == 1 ? "Also delete the downloaded file"
+                        : "Also delete the downloaded files");
     box.setCheckBox(alsoDeleteFile);
 
     QAbstractButton* removeBtn = box.addButton("Remove", QMessageBox::AcceptRole);
@@ -414,13 +884,16 @@ void MainWindow::onRemoveClicked() {
 
     box.exec();
     if (box.clickedButton() == removeBtn) {
-        manager_->remove(id, alsoDeleteFile->isChecked());
+        for (qint64 id : ids) manager_->remove(id, alsoDeleteFile->isChecked());
     }
 }
 
 void MainWindow::onOpenFolderClicked() {
     const qint64 id = currentDownloadId();
-    if (id == 0) return;
+    if (id != 0) openFolderFor(id);
+}
+
+void MainWindow::openFolderFor(qint64 id) {
     const auto row = manager_->row(id);
     if (!row) return;
     const QString folder = QFileInfo(row->rec.outputPath).absolutePath();
@@ -456,6 +929,11 @@ void MainWindow::openDetailsFor(qint64 id) {
 }
 
 void MainWindow::onDownloadCompleted(qint64 id) {
+    // With the main list on screen the row itself (plus the tray balloon)
+    // already announces completion; the modal is only for the browser flow
+    // where a lone details window was the whole UI.
+    if (isVisible()) return;
+
     const auto row = manager_->row(id);
     if (!row) return;
     const QString path = row->rec.outputPath;
@@ -497,18 +975,21 @@ void MainWindow::onUpdateYtDlp() {
 }
 
 void MainWindow::onTableContextMenu(const QPoint& pos) {
-    // Select the row under the cursor first so action enabled-states match
-    // what the menu is about to act on. customContextMenuRequested delivers
-    // pos in viewport coordinates.
-    const QModelIndex idx = table_->indexAt(pos);
+    // If the click landed on a row outside the current selection, move the
+    // selection there so the menu acts on what's under the cursor. A click
+    // inside the selection keeps it, so multi-row actions work.
+    // customContextMenuRequested delivers pos in viewport coordinates.
+    const QModelIndex idx = list_->indexAt(pos);
     if (idx.isValid()) {
-        table_->selectRow(idx.row());
+        if (!list_->selectionModel()->isRowSelected(idx.row(), QModelIndex())) {
+            selectProxyRow(idx.row());
+        }
     } else {
-        table_->clearSelection();
+        list_->clearSelection();
     }
 
     QMenu menu(this);
-    if (currentDownloadId() == 0) {
+    if (selectedDownloadIds().isEmpty()) {
         // No row clicked -- offer the only action that makes sense in empty
         // space.
         menu.addAction(newAction_);
@@ -525,7 +1006,7 @@ void MainWindow::onTableContextMenu(const QPoint& pos) {
         menu.addSeparator();
         menu.addAction(removeAction_);
     }
-    menu.exec(table_->viewport()->mapToGlobal(pos));
+    menu.exec(list_->viewport()->mapToGlobal(pos));
 }
 
 }  // namespace fdm_gui

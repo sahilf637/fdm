@@ -517,6 +517,10 @@ struct DownloadEngine::DownloadState {
     std::deque<Segment> segments;      // deque: element pointers survive push_back
     int nextSegmentIndex = 0;
     int connLimit = kInitialConnections;
+    // Hard cap on adaptive growth. Lowered when a server rejects an extra
+    // connection outright (e.g. 403 on the Nth parallel request) so the grow
+    // logic doesn't walk back into the same wall every quiet window.
+    int growCeiling = kMaxConnections;
     int activeCount = 0;
     std::chrono::steady_clock::time_point lastThrottle{};
     std::chrono::steady_clock::time_point lastGrowAt{};
@@ -996,6 +1000,19 @@ void DownloadEngine::onSegmentDone(DownloadState* state, int segIndex, CURLcode 
     if (state->done) return;  // a sibling already drove us terminal
     state->activeCount--;
 
+    // A "fatal" HTTP status (403/404/...) on one segment while the server is
+    // still serving sibling segments -- or has already served us bytes -- is
+    // almost always per-connection throttling (hosts that hard-reject the Nth
+    // parallel connection instead of answering 429), not a dead URL: the
+    // probe already succeeded. Retry it like a throttle instead of killing a
+    // working download. A genuinely dead URL still fails: either every
+    // segment dies with nothing received, or the retry cap runs out.
+    // 416 is exempt: "range not satisfiable" can never succeed on retry.
+    const bool throttleLikely =
+        rc == CURLE_HTTP_RETURNED_ERROR && http != 416 &&
+        classifyError(rc, http) == RetryDecision::Fatal &&
+        (state->activeCount > 0 || sumReceived(*state) > 0);
+
     if (capped || rc == CURLE_OK) {
         seg->status = ChunkProgress::Status::Done;
     } else if (http == 416 && seg->endByte < 0 && seg->bytesReceived > 0) {
@@ -1009,7 +1026,7 @@ void DownloadEngine::onSegmentDone(DownloadState* state, int segIndex, CURLcode 
         // the body at this chunk's offset would corrupt the file.
         failDownload(state, "ranged request not honored (file changed on server?)");
         return;
-    } else if (classifyError(rc, http) == RetryDecision::Retry) {
+    } else if (classifyError(rc, http) == RetryDecision::Retry || throttleLikely) {
         // Transient (429 / connect / timeout / reset): requeue with backoff,
         // but give up for good after too many failed attempts on one segment.
         seg->status = ChunkProgress::Status::Pending;
@@ -1026,13 +1043,19 @@ void DownloadEngine::onSegmentDone(DownloadState* state, int segIndex, CURLcode 
                 std::min(retryAfterSecs, kMaxRetryAfterSecs) * 1000));
         }
         seg->dueAt = now + delay;
-        if (http == 429) {
+        if (http == 429 || throttleLikely) {
             // Server is rate-limiting concurrency: back the cap off (AIMD).
             state->connLimit = std::max(1, state->connLimit - 1);
             state->lastThrottle = now;
         }
+        if (throttleLikely) {
+            // A hard rejection (vs. 429's "later") pins the cap: re-growing
+            // past it would just re-trigger the same rejection forever.
+            state->growCeiling = state->connLimit;
+        }
     } else {
-        failDownload(state, describeError(rc, http));  // 403/404/TLS/... -> fatal
+        // TLS / write errors / 4xx with nothing ever served -> fatal.
+        failDownload(state, describeError(rc, http));
         return;
     }
 
@@ -1074,6 +1097,7 @@ void DownloadEngine::failDownload(DownloadState* state, const std::string& reaso
         if (seg.task) {
             // Remove the handle before its task is destroyed next tick.
             curl_multi_remove_handle(multi_, seg.task->easy());
+            seg.bytesReceived = seg.task->bytesWritten();
             state->reaping.push_back(std::move(seg.task));
         }
         if (seg.status == ChunkProgress::Status::Active ||
@@ -1082,6 +1106,13 @@ void DownloadEngine::failDownload(DownloadState* state, const std::string& reaso
     }
     state->activeCount = 0;
     state->fatalError = reason;
+    // Final snapshot before the terminal event so the caller persists exact
+    // per-segment byte counts and Failed statuses -- a later resume restarts
+    // from precisely these offsets.
+    if (!state->segments.empty()) {
+        state->emit(Progress{sumReceived(*state), state->totalBytes, 0.0,
+                             snapshotChunks(*state), 0, state->connLimit});
+    }
     state->emit(Failed{reason});
     state->done = true;
 }
@@ -1269,7 +1300,7 @@ void DownloadEngine::runLoop() {
                 // Time-based, not completion-based: with multi-MiB segments,
                 // waiting for one to finish would defer full parallelism to
                 // the tail of the download.
-                if (st->activeCount > 0 && st->connLimit < kMaxConnections &&
+                if (st->activeCount > 0 && st->connLimit < st->growCeiling &&
                     (st->lastThrottle.time_since_epoch().count() == 0 ||
                      progNow - st->lastThrottle >= kGrowQuietWindow) &&
                     progNow - st->lastGrowAt >= kGrowQuietWindow) {
@@ -1345,15 +1376,9 @@ void DownloadEngine::cancel(DownloadId id) {
     post([this, id] {
         auto* state = findById(id);
         if (!state || state->done) return;
-        for (auto& seg : state->segments) {
-            if (seg.task) {
-                curl_multi_remove_handle(multi_, seg.task->easy());
-                state->reaping.push_back(std::move(seg.task));
-            }
-        }
-        state->activeCount = 0;
-        state->emit(Failed{"Cancelled"});
-        state->done = true;  // reaped on the next run-loop tick
+        // Same teardown as a fatal error (snapshot bytes, mark segments,
+        // emit the terminal Failed); the reason string is the only difference.
+        failDownload(state, "Cancelled");
     });
 }
 

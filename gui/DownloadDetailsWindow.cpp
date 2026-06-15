@@ -39,7 +39,9 @@ constexpr int kColAttempts = 4;
 constexpr int kColStatus = 5;
 constexpr int kColCount = 6;
 
-constexpr const char* kAccent = "#2176ff";
+// Matches theme::accent() / theme::statusColor() in Theme.cpp so this window
+// reads as part of the same app as the redesigned main list.
+constexpr const char* kAccent = "#3b82f6";
 
 // A muted-but-always-readable text colour derived from the active palette
 // (60% real text + 40% background). Theme-safe: stays visible in both light and
@@ -114,9 +116,9 @@ QString statusText(DownloadStatus s) {
 const char* statusColor(DownloadStatus s) {
     switch (s) {
         case DownloadStatus::Active:     return kAccent;
-        case DownloadStatus::Paused:     return "#e0a526";
-        case DownloadStatus::Completed:  return "#1faf5a";
-        case DownloadStatus::Failed:     return "#e5484d";
+        case DownloadStatus::Paused:     return "#bf8700";
+        case DownloadStatus::Completed:  return "#2da44e";
+        case DownloadStatus::Failed:     return "#d1242f";
         case DownloadStatus::Finalizing: return "#8a63d2";
         case DownloadStatus::Queued:     return "#6b7280";
     }
@@ -125,10 +127,10 @@ const char* statusColor(DownloadStatus s) {
 
 const char* chunkColor(ChunkPersistStatus s) {
     switch (s) {
-        case ChunkPersistStatus::Done:    return "#1faf5a";
+        case ChunkPersistStatus::Done:    return "#2da44e";
         case ChunkPersistStatus::Active:  return kAccent;
-        case ChunkPersistStatus::Pending: return "#e0a526";
-        case ChunkPersistStatus::Failed:  return "#e5484d";
+        case ChunkPersistStatus::Pending: return "#bf8700";
+        case ChunkPersistStatus::Failed:  return "#d1242f";
     }
     return kAccent;
 }
@@ -283,10 +285,16 @@ void DownloadDetailsWindow::refresh() {
 
     nameLabel_->setFullText(QFileInfo(row.rec.outputPath).fileName());
     statusPill_->setText(statusText(st));
+    // Soft pill (translucent fill + coloured text), same treatment as the
+    // main list's status pills.
+    const QColor pillColor(statusColor(st));
     statusPill_->setStyleSheet(
-        QString("background:%1; color:white; border-radius:9px; padding:2px 12px;"
-                " font-size:12px; font-weight:600;")
-            .arg(statusColor(st)));
+        QString("background: rgba(%1,%2,%3,22%); color:%4; border-radius:9px;"
+                " padding:2px 12px; font-size:12px; font-weight:600;")
+            .arg(pillColor.red())
+            .arg(pillColor.green())
+            .arg(pillColor.blue())
+            .arg(pillColor.name()));
     urlLabel_->setFullText("URL: " + row.rec.url);
     pathLabel_->setFullText("Path: " + row.rec.outputPath);
 
@@ -364,7 +372,9 @@ void DownloadDetailsWindow::refresh() {
     const bool completed = st == DownloadStatus::Completed;
     const bool finalizing = st == DownloadStatus::Finalizing;
     pauseBtn_->setVisible(active && !finalizing);
-    resumeBtn_->setVisible(paused);
+    // A failed download with partial chunk state resumes from where it
+    // stopped (Retry restarts from byte zero).
+    resumeBtn_->setVisible(paused || manager_->canResumeFromChunks(id_));
     cancelBtn_->setVisible((active || paused) && !finalizing);
     retryBtn_->setVisible(failed);
     redownloadBtn_->setVisible(failed || completed);

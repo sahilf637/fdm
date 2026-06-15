@@ -24,6 +24,27 @@ public:
         ColCount
     };
 
+    // Raw per-download values, valid on any column of a row. Consumed by the
+    // filter proxy (category/search/sort) and the card delegate, which need
+    // the underlying data rather than the formatted display strings.
+    enum Role {
+        IdRole = Qt::UserRole + 1,
+        NameRole,             // QString: output file leaf name
+        UrlRole,              // QString
+        OutputPathRole,       // QString: full save path
+        StatusRole,           // int: DownloadStatus
+        KindRole,             // QString: "http" (also for empty) or "video"
+        BytesReceivedRole,    // qint64
+        TotalBytesRole,       // qint64: -1 when unknown
+        SpeedRole,            // double: bytes/sec, 0 when not active
+        CreatedAtRole,        // qint64: unix seconds
+        UpdatedAtRole,        // qint64: unix seconds
+        ErrorRole,            // QString: last error, empty if none
+        ActiveConnectionsRole,// int
+        ConnectionLimitRole,  // int
+        CanResumeRole,        // bool: Failed row resumable from saved chunks
+    };
+
     explicit DownloadListModel(DownloadManager* manager, QObject* parent = nullptr);
 
     int rowCount(const QModelIndex& parent = QModelIndex()) const override;
