@@ -977,6 +977,15 @@ void DownloadManager::pause(qint64 id) {
     engine_->pause(row->engineId);
 }
 
+bool DownloadManager::canResumeFromChunks(qint64 id) const {
+    const auto opt = row(id);
+    if (!opt) return false;
+    return opt->rec.status == DownloadStatus::Failed &&
+           opt->rec.kind != "video" && opt->rec.supportsRanges &&
+           opt->rec.totalBytes > 0 && !opt->chunks.isEmpty() &&
+           opt->bytesReceived > 0;
+}
+
 void DownloadManager::resume(qint64 id) {
     DownloadLiveRow* row = find(id);
     if (!row) return;
@@ -1010,6 +1019,13 @@ void DownloadManager::resume(qint64 id) {
             row->rec.url.toStdString(), row->rec.outputPath.toStdString(),
             headersFromJson(row->rec.requestHeaders), makeEngineCallback(id));
         return;
+    }
+
+    // Resuming a failed download: its chunks carry the attempt counts that
+    // exhausted the engine's retry budget. Reset them so the new run gets a
+    // fresh budget instead of failing again on the first transient error.
+    if (row->rec.status == DownloadStatus::Failed) {
+        for (ChunkRecord& c : row->chunks) c.attempts = 1;
     }
 
     fdm::ResumeSpec spec = buildResumeSpec(*row);

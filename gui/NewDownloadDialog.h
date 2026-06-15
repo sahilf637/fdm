@@ -38,9 +38,11 @@ public:
 
     // Switch to "video" mode for a yt-dlp download: Start skips the HTTP HEAD
     // probe (the URL is a page/stream URL, not a file) and just resolves
-    // folder + name. The URL becomes read-only and the hash row is hidden
-    // (a muxed video has nothing to verify). Call once, before exec().
-    void setVideoMode();
+    // folder + name. The hash row is hidden (a muxed video has nothing to
+    // verify). The URL is read-only by default (the extension flow already
+    // resolved it); pass urlEditable=true for the manual "Add video" entry
+    // point where the user types the page URL. Call once, before exec().
+    void setVideoMode(bool urlEditable = false);
 
     // Extra request headers (Cookie / Referer / User-Agent) sent on the probe
     // this dialog runs when the user clicks Start. Needed so an authenticated

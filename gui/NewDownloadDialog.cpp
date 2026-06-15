@@ -125,6 +125,7 @@ void NewDownloadDialog::buildUi() {
     statusLabel_->setVisible(false);
 
     startBtn_ = new QPushButton("Start");
+    startBtn_->setObjectName("primaryButton");
     startBtn_->setDefault(true);
     cancelBtn_ = new QPushButton("Cancel");
 
@@ -195,13 +196,17 @@ void NewDownloadDialog::handleProbeResult(const ProbeResult& result) {
     finishWithFilename(filename);
 }
 
-void NewDownloadDialog::setVideoMode() {
+void NewDownloadDialog::setVideoMode(bool urlEditable) {
     videoMode_ = true;
     setWindowTitle("Download Video");
-    // The URL is a page/stream URL resolved by yt-dlp (quality was already
-    // chosen in the browser panel), so it isn't editable here; and a muxed
-    // video has no post-download hash to check.
-    urlEdit_->setReadOnly(true);
+    // From the browser panel the URL was already resolved (quality chosen
+    // in-page), so it isn't editable; the manual menu entry needs it typed.
+    // Either way a muxed video has no post-download hash to check.
+    urlEdit_->setReadOnly(!urlEditable);
+    if (urlEditable) {
+        urlEdit_->setPlaceholderText("https://example.com/watch?v=…");
+        nameEdit_->setPlaceholderText("video title (extension decided by yt-dlp)");
+    }
     form_->setRowVisible(hashEdit_, false);
 }
 
