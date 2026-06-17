@@ -5,9 +5,9 @@
 
 # Extension IDs the native host is allowed to talk to. Override at configure
 # time once the add-ons are published, e.g.
-#   -DFDM_FIREFOX_EXTENSION_ID=fdm@theninjastudio.com
+#   -DFDM_FIREFOX_EXTENSION_ID={d324a09c-fb86-4cff-918a-54a1a1e4bf1a}
 #   -DFDM_CHROME_EXTENSION_ID=<id from the Chrome Web Store>
-set(FDM_FIREFOX_EXTENSION_ID "suspended035@gmail.com"
+set(FDM_FIREFOX_EXTENSION_ID "{d324a09c-fb86-4cff-918a-54a1a1e4bf1a}"
     CACHE STRING "Gecko ID of the published Firefox add-on (allowed_extensions).")
 set(FDM_CHROME_EXTENSION_ID ""
     CACHE STRING "Chrome Web Store ID of the published extension (allowed_origins).")

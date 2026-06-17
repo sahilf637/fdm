@@ -50,7 +50,7 @@ vs `scripts`), and Chrome rejects the Firefox form — so there are two manifest
   `about:debugging` → **This Firefox** → **Load Temporary Add-on** → select
   `extension/dist-firefox/manifest.json`. (Temporary add-ons reset on restart;
   for persistence use Developer/ESR with `xpinstall.signatures.required=false`,
-  or sign via AMO. The extension ID is fixed: `suspended035@gmail.com`.)
+  or sign via AMO. The extension ID is fixed: `{d324a09c-fb86-4cff-918a-54a1a1e4bf1a}`.)
 
 ### 3. Register the native host
 

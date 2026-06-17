@@ -11,7 +11,7 @@
 set -euo pipefail
 
 HOST_NAME="com.fdm.native_host"
-GECKO_ID="suspended035@gmail.com"
+GECKO_ID="{d324a09c-fb86-4cff-918a-54a1a1e4bf1a}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

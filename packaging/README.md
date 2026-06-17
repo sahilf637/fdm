@@ -61,15 +61,15 @@ The host only talks to extension IDs it's been told to trust. After publishing:
 
 1. **Firefox** — set the add-on's gecko ID (`browser_specific_settings.gecko.id`
    in [`extension/manifest.firefox.json`](../extension/manifest.firefox.json));
-   it's currently the placeholder `suspended035@gmail.com`.
+   it defaults to `{d324a09c-fb86-4cff-918a-54a1a1e4bf1a}`.
 2. **Chrome** — the Web Store assigns a permanent ID on publish.
 3. Rebuild the package with both baked in:
 
    ```sh
-   FDM_FIREFOX_EXTENSION_ID=fdm@theninjastudio.com \
+   FDM_FIREFOX_EXTENSION_ID={d324a09c-fb86-4cff-918a-54a1a1e4bf1a} \
    FDM_CHROME_EXTENSION_ID=<web-store-id>
    # pass them through dh:
-   DEB_CMAKE_EXTRA_FLAGS="-DFDM_FIREFOX_EXTENSION_ID=fdm@theninjastudio.com \
+   DEB_CMAKE_EXTRA_FLAGS="-DFDM_FIREFOX_EXTENSION_ID={d324a09c-fb86-4cff-918a-54a1a1e4bf1a} \
                           -DFDM_CHROME_EXTENSION_ID=<web-store-id>" \
    dpkg-buildpackage -b -us -uc
    ```

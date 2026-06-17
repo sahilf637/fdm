@@ -1,7 +1,7 @@
 Source: fdm
 Section: net
 Priority: optional
-Maintainer: Sahil Singh <sahil@theninjastudio.com>
+Maintainer: Sahil Singh <sahilfartyal3@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cmake,
                libcurl4-openssl-dev,
