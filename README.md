@@ -9,6 +9,7 @@ cookies/referer so login-protected files keep working.
 
 ![FDM main window](docs/screenshots/main-window.png)
 
+
 The **Download Details** window shows every segment of a download live —
 including the ones created on the fly when FDM splits a slow chunk to keep all
 connections busy (segments 5 and 6 below are tails carved out of segment 2):
@@ -58,6 +59,32 @@ connections busy (segments 5 and 6 below are tails carved out of segment 2):
 | `extension/` | MV3 browser extension (Chrome + Firefox). |
 | `ipc/`       | Local-socket protocol shared by the GUI and the host. |
 | `tests/`     | doctest-based test suite (uses local fixture servers, no internet needed). |
+| `packaging/` | Debian (`.deb`) packaging, desktop entry, icons, and system-wide native-host registration. |
+
+## Install
+
+### Debian / Ubuntu — `.deb` (recommended)
+
+Download the latest `fdm_*.deb` from the
+[Releases page](https://github.com/sahilf637/fdm/releases) and install it; `apt`
+pulls in Qt, libcurl, and the SQLite driver automatically:
+
+```sh
+sudo apt install ./fdm_1.0.0_amd64.deb
+```
+
+The package installs `fdm-gui`, `fdm-cli`, and the browser bridge, and registers
+the native-messaging host **system-wide** — so the
+[browser extension](#browser-extension) connects with no per-user setup. Launch
+**FDM** from your application grid, or run `fdm-gui`.
+
+> ⚠️ The browser bridge needs an **unconfined** browser. Ubuntu's default *snap*
+> Firefox can't reach the host (a sandbox limitation, not a bug) — use Mozilla's
+> `.deb` Firefox or a `.deb` Chrome/Chromium.
+
+Building the `.deb` yourself — and baking in the published extension IDs — is
+documented in [`packaging/README.md`](packaging/README.md). To run from source
+instead, see [Build](#build) below.
 
 ## Requirements
 
@@ -148,6 +175,10 @@ Download** dialog pre-filled with the URL, filename, and auth context.
 Browser ──(native messaging, stdio)──▶ fdm-native-host ──(local socket)──▶ fdm-gui
 ```
 
+> **Installed the `.deb`?** The native-messaging host is already registered
+> system-wide — skip step 3 below; just load (or, once published, install) the
+> extension. The steps below otherwise assume a **source build**.
+
 Quick setup:
 
 1. **Build** the app and host (above) — you need `build/host/fdm-native-host`.
@@ -181,3 +212,8 @@ ctest --test-dir build --output-on-failure
 
 The suite spins up local fixture servers (under `tests/`), so it runs fully
 offline.
+
+## License
+
+FDM is free software, released under the
+[GNU General Public License v3.0 or later](LICENSE) (GPL-3.0-or-later).

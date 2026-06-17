@@ -1,0 +1,33 @@
+Source: fdm
+Section: net
+Priority: optional
+Maintainer: Sahil Singh <sahil@theninjastudio.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               libcurl4-openssl-dev,
+               qt6-base-dev,
+               qt6-base-dev-tools
+Standards-Version: 4.6.2
+Homepage: https://github.com/sahilf637/fdm
+Rules-Requires-Root: no
+
+Package: fdm
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libqt6sql6-sqlite
+Recommends: ffmpeg,
+            yt-dlp,
+            qt6-wayland
+Suggests: firefox | chromium | google-chrome-stable
+Description: fast multi-connection download manager
+ FDM splits each download across several parallel HTTP connections, adapts the
+ connection count to the server in real time, and resumes cleanly after a pause
+ or restart.
+ .
+ This package provides the Qt desktop app (fdm-gui), a command-line tool
+ (fdm-cli), and the native-messaging host that lets the FDM browser extension
+ route downloads from Chrome/Firefox straight into FDM.
+ .
+ ffmpeg and yt-dlp are recommended for video/streaming downloads; ordinary file
+ downloads need neither.

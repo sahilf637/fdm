@@ -21,6 +21,12 @@ Browser ──(native messaging, stdio)──▶ fdm-native-host ──(local so
 
 ## Setup (manual / local)
 
+> If you installed FDM from the **`.deb`**, the native host is already registered
+> system-wide (`/usr/lib/mozilla/native-messaging-hosts/`, plus `/etc/opt/chrome/`
+> and `/etc/chromium/` when the package was built with a Chrome ID) — skip
+> straight to loading the extension and **skip step 3**. The steps below are for
+> running from a source build.
+
 ### 1. Build the app + host
 
 ```sh

@@ -1,0 +1,7 @@
+{
+  "name": "com.fdm.native_host",
+  "description": "FDM native messaging host",
+  "path": "@FDM_NATIVE_HOST_PATH@",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://@FDM_CHROME_EXTENSION_ID@/"]
+}

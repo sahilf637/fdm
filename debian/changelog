@@ -1,0 +1,6 @@
+fdm (1.0.0) unstable; urgency=medium
+
+  * Initial release: Debian packaging for fdm-gui, fdm-cli, and the browser
+    native-messaging host, with system-wide native-host registration.
+
+ -- Sahil Singh <sahil@theninjastudio.com>  Wed, 17 Jun 2026 14:25:34 +0530
