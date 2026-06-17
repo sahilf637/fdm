@@ -3,3 +3,5 @@ add_executable(fdm-native-host
 )
 target_include_directories(fdm-native-host PRIVATE ${CMAKE_SOURCE_DIR}/ipc)
 target_link_libraries(fdm-native-host PRIVATE Qt6::Core Qt6::Network)
+
+install(TARGETS fdm-native-host RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

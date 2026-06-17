@@ -33,3 +33,5 @@ add_custom_command(
   COMMAND chmod +x $<TARGET_FILE_DIR:fdm-gui>/fdm-gui.sh
   VERBATIM
 )
+
+install(TARGETS fdm-gui RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

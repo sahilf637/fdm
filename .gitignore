@@ -2,3 +2,13 @@ build/
 .cache/
 compile_commands.json
 extension/dist-firefox/
+
+# deb build artifacts (dpkg-buildpackage)
+obj-*/
+_stage/
+/debian/.debhelper/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/fdm/
+/debian/*.substvars
+/debian/*.debhelper.log

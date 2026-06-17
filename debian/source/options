@@ -1,0 +1,7 @@
+# Keep the dev build tree and VCS data out of any source tarball.
+tar-ignore = build
+tar-ignore = build/*
+tar-ignore = .git
+tar-ignore = .git/*
+tar-ignore = _stage
+tar-ignore = _stage/*
