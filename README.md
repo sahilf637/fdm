@@ -7,14 +7,13 @@ a **Qt desktop app**, a **command-line tool**, and a **browser extension** that
 routes downloads straight from Chrome/Firefox into FDM — carrying along the
 cookies/referer so login-protected files keep working.
 
-![FDM main window](docs/screenshots/main-window.png)
-
+![FDM main window](docs/screenshots/main-window1.png)
 
 The **Download Details** window shows every segment of a download live —
 including the ones created on the fly when FDM splits a slow chunk to keep all
 connections busy (segments 5 and 6 below are tails carved out of segment 2):
 
-![Download details with per-segment progress](docs/screenshots/download-details.png)
+![Download details with per-segment progress](docs/screenshots/download-details1.png)
 
 ## Features
 
@@ -37,7 +36,7 @@ connections busy (segments 5 and 6 below are tails carved out of segment 2):
   (`Content-Digest` / `Digest` / `Content-MD5`) and the suggested filename
   (`Content-Disposition`, RFC 6266/5987).
 - **Browser integration** — capture downloads from Chrome/Firefox, or use the
-  right-click *Download with FDM*; cookies/referer/user-agent are forwarded so
+  right-click _Download with FDM_; cookies/referer/user-agent are forwarded so
   authenticated downloads work.
 - **Video & streaming downloads** — pick a quality from the in-page panel or
   right-click a video; FDM extracts with **yt-dlp** and muxes with **ffmpeg**.
@@ -49,16 +48,16 @@ connections busy (segments 5 and 6 below are tails carved out of segment 2):
 
 ## Components
 
-| Path         | What it is |
-|--------------|------------|
-| `engine/`    | libcurl-based download engine (`fdm_engine`): segmentation, scheduling, retries, resume. |
-| `store/`     | Qt persistence layer (`fdm_store`): SQLite database, download manager, list model. |
-| `gui/`       | Qt 6 Widgets desktop app (`fdm-gui`). |
-| `cli/`       | Command-line tool (`fdm-cli`). |
-| `host/`      | Native-messaging bridge (`fdm-native-host`) between the browser and the GUI. |
-| `extension/` | MV3 browser extension (Chrome + Firefox). |
-| `ipc/`       | Local-socket protocol shared by the GUI and the host. |
-| `tests/`     | doctest-based test suite (uses local fixture servers, no internet needed). |
+| Path         | What it is                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------ |
+| `engine/`    | libcurl-based download engine (`fdm_engine`): segmentation, scheduling, retries, resume.   |
+| `store/`     | Qt persistence layer (`fdm_store`): SQLite database, download manager, list model.         |
+| `gui/`       | Qt 6 Widgets desktop app (`fdm-gui`).                                                      |
+| `cli/`       | Command-line tool (`fdm-cli`).                                                             |
+| `host/`      | Native-messaging bridge (`fdm-native-host`) between the browser and the GUI.               |
+| `extension/` | MV3 browser extension (Chrome + Firefox).                                                  |
+| `ipc/`       | Local-socket protocol shared by the GUI and the host.                                      |
+| `tests/`     | doctest-based test suite (uses local fixture servers, no internet needed).                 |
 | `packaging/` | Debian (`.deb`) packaging, desktop entry, icons, and system-wide native-host registration. |
 
 ## Install
@@ -78,7 +77,7 @@ the native-messaging host **system-wide** — so the
 [browser extension](#browser-extension) connects with no per-user setup. Launch
 **FDM** from your application grid, or run `fdm-gui`.
 
-> ⚠️ The browser bridge needs an **unconfined** browser. Ubuntu's default *snap*
+> ⚠️ The browser bridge needs an **unconfined** browser. Ubuntu's default _snap_
 > Firefox can't reach the host (a sandbox limitation, not a bug) — use Mozilla's
 > `.deb` Firefox or a `.deb` Chrome/Chromium.
 
@@ -183,17 +182,17 @@ Quick setup:
 
 1. **Build** the app and host (above) — you need `build/host/fdm-native-host`.
 2. **Load the extension:**
-   - **Chrome / Chromium:** `chrome://extensions` → enable *Developer mode* →
-     *Load unpacked* → select the `extension/` folder. Copy the extension ID.
+   - **Chrome / Chromium:** `chrome://extensions` → enable _Developer mode_ →
+     _Load unpacked_ → select the `extension/` folder. Copy the extension ID.
    - **Firefox:** run `extension/pack-firefox.sh`, then `about:debugging` →
-     *This Firefox* → *Load Temporary Add-on* → pick
+     _This Firefox_ → _Load Temporary Add-on_ → pick
      `extension/dist-firefox/manifest.json`.
 3. **Register the native host:**
    ```sh
    ./extension/install-host.sh --chrome-id <ID from chrome://extensions>
    ```
-4. **Verify:** open the extension popup → *Test connection* → should say
-   *Connected to FDM*.
+4. **Verify:** open the extension popup → _Test connection_ → should say
+   _Connected to FDM_.
 
 > **⚠️ Snap Firefox (the Ubuntu default) is not supported.** Its sandbox refuses
 > to launch an external native-messaging host. Use the **non-snap Firefox**
