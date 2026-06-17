@@ -1,6 +1,6 @@
 # Fresh Download Manager (FDM)
 
-A fast, multi-connection download manager for Linux. FDM splits each download
+A fast, multi-connection download manager for Linux. FDM splits each downloads
 across several parallel HTTP connections, adapts the connection count to the
 server in real time, and resumes cleanly after a pause or restart. It ships as
 a **Qt desktop app**, a **command-line tool**, and a **browser extension** that
