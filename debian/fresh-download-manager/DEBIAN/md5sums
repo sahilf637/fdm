@@ -1,0 +1,12 @@
+2b6f0d955331b6624512d35273c2a1eb  usr/bin/fdm-cli
+0bc1153c8d6b8e7b6a2a6e9399673246  usr/bin/fdm-gui
+b5800bb2dafed259527ed9c8c3752df3  usr/bin/fdm-native-host
+2d28a9a30c1f3416c68697d0037f3259  usr/lib/mozilla/native-messaging-hosts/com.fdm.native_host.json
+d23588003e1cfbbd8b47d938df32bb35  usr/share/applications/fdm.desktop
+5502ac72215c75402b7e75b1ec97993a  usr/share/doc/fresh-download-manager/changelog.gz
+a3e11ca9fac92980874f6bcadf5a7514  usr/share/doc/fresh-download-manager/copyright
+cb9bd3e22783951392dc536eb77bee52  usr/share/icons/hicolor/128x128/apps/fdm.png
+3f500fdfd014df46f322fd92f4c25cce  usr/share/icons/hicolor/16x16/apps/fdm.png
+2221a30e42d7de8da2277dbbb22141c0  usr/share/icons/hicolor/256x256/apps/fdm.png
+b26300a43b44a9a4f150ce4ee616951f  usr/share/icons/hicolor/32x32/apps/fdm.png
+dcf517c751a3aa7348db3eece84308ae  usr/share/icons/hicolor/48x48/apps/fdm.png

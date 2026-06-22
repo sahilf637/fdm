@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=FDM
+GenericName=Download Manager
+Comment=Fast multi-connection download manager
+Exec=fdm-gui %u
+Icon=fdm
+Terminal=false
+Categories=Network;FileTransfer;
+StartupWMClass=fdm

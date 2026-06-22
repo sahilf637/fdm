@@ -1,4 +1,4 @@
-fdm (1.0.0) unstable; urgency=medium
+fresh-download-manager (1.0.0) unstable; urgency=medium
 
   * Initial release: Debian packaging for fdm-gui, fdm-cli, and the browser
     native-messaging host, with system-wide native-host registration.

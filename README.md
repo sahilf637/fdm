@@ -64,12 +64,12 @@ connections busy (segments 5 and 6 below are tails carved out of segment 2):
 
 ### Debian / Ubuntu — `.deb` (recommended)
 
-Download the latest `fdm_*.deb` from the
+Download the latest `fresh-download-manager_*.deb` from the
 [Releases page](https://github.com/sahilf637/fdm/releases) and install it; `apt`
 pulls in Qt, libcurl, and the SQLite driver automatically:
 
 ```sh
-sudo apt install ./fdm_1.0.0_amd64.deb
+sudo apt install ./fresh-download-manager_1.0.0_amd64.deb
 ```
 
 The package installs `fdm-gui`, `fdm-cli`, and the browser bridge, and registers

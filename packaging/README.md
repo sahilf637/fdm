@@ -45,13 +45,13 @@ sudo apt install build-essential debhelper cmake \
 dpkg-buildpackage -b -us -uc
 
 # the package lands one level up:
-ls ../fdm_1.0.0_*.deb
+ls ../fresh-download-manager_1.0.0_*.deb
 ```
 
 Install / test:
 
 ```sh
-sudo apt install ../fdm_1.0.0_*.deb     # apt pulls the dependencies
+sudo apt install ../fresh-download-manager_1.0.0_*.deb     # apt pulls the dependencies
 fdm-gui                                  # or launch "FDM" from the app grid
 ```
 

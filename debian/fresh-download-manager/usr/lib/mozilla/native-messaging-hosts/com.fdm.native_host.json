@@ -1,0 +1,7 @@
+{
+  "name": "com.fdm.native_host",
+  "description": "FDM native messaging host",
+  "path": "/usr/bin/fdm-native-host",
+  "type": "stdio",
+  "allowed_extensions": ["{d324a09c-fb86-4cff-918a-54a1a1e4bf1a}"]
+}
